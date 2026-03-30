@@ -6,7 +6,7 @@ A lightweight HTTP proxy that lets Claude Code talk to the ALCF Argo API through
 
 - SSH access to CELS machines ([setup guide](https://help.cels.anl.gov/docs/linux/ssh/))
 - Python 3.8+
-- Claude Code (`npm install -g @anthropic-ai/claude-code`)
+- Claude Code (`curl -fsSL https://claude.ai/install.sh | bash`)
 
 ## Quick Start
 
