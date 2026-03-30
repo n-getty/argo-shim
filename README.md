@@ -32,19 +32,17 @@ claude
 
 ## Claude Code Settings
 
-The shim auto-updates `~/.claude/settings.json`, but for first-time setup you need:
+The shim automatically creates `~/.claude/settings.json` on first run and keeps the port in `ANTHROPIC_BASE_URL` correct on subsequent runs. No manual setup needed.
+
+To use a specific model (e.g., Opus), add a `"model"` field to your settings:
 
 ```json
 {
-  "apiKeyHelper": "echo <username>",
-  "env": {
-    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8081/argoapi",
-    "CLAUDE_CODE_SKIP_ANTHROPIC_AUTH": "1"
-  }
+  "model": "claudeopus46"
 }
 ```
 
-The shim will keep the port in `ANTHROPIC_BASE_URL` correct on subsequent runs.
+Without this, Claude Code defaults to Sonnet.
 
 ## Health Checks
 
