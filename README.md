@@ -90,7 +90,7 @@ The shim port may have changed. The shim updates `~/.claude/settings.json` autom
 
 **"ERROR: The requested URL could not be retrieved" in Claude Code**
 
-If you see the above in Claude Code after sending a prompt, you may need to unset some HTTP proxies.
-In particular, see if HTTP_PROXY is set, and unset it. (In the past ANL has
-recommended `export HTTP_PROXY="http://proxy.alcf.anl.gov:3128"`. This setting can cause
-the issue.)
+If you see the above in Claude Code after sending a prompt, you may need to unset some HTTP proxies in your .bashrc.
+
+Please use these proxy settings to prevent setting proxies on login nodes.
+https://docs.alcf.anl.gov/aurora/getting-started-on-aurora/#proxy
