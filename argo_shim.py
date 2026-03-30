@@ -135,6 +135,30 @@ def verify_tunnel(port, host="127.0.0.1"):
         return False
 
 
+def is_own_process(port):
+    """Check if the process listening on a port belongs to the current user."""
+    try:
+        result = subprocess.run(
+            ["lsof", "-ti", f"TCP@127.0.0.1:{port}", "-sTCP:LISTEN"],
+            capture_output=True, text=True, timeout=5
+        )
+        for pid in result.stdout.strip().split('\n'):
+            if not pid:
+                continue
+            stat = subprocess.run(
+                ["ps", "-o", "user=", "-p", pid],
+                capture_output=True, text=True, timeout=5
+            )
+            owner = stat.stdout.strip()
+            if owner == API_KEY:
+                return True
+            print(f"  Skipping port {port} (owned by {owner}, not {API_KEY})")
+            return False
+    except Exception:
+        pass
+    return False
+
+
 def find_existing_tunnel(base, host="127.0.0.1"):
     """Check if a verified tunnel to REAL_HOST already exists in the port range."""
     for port in range(base, base + MAX_PORT_RETRIES):
@@ -142,6 +166,8 @@ def find_existing_tunnel(base, host="127.0.0.1"):
             s.settimeout(1)
             try:
                 s.connect((host, port))
+                if not is_own_process(port):
+                    continue
                 print(f"Port {port} is listening, verifying tunnel...")
                 if verify_tunnel(port, host):
                     return port
