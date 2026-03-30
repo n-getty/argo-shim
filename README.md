@@ -87,3 +87,10 @@ kill <pid>
 **Claude Code can't connect after restarting the shim**
 
 The shim port may have changed. The shim updates `~/.claude/settings.json` automatically, but you need to restart Claude Code to pick up the new port.
+
+**"ERROR: The requested URL could not be retrieved" in Claude Code**
+
+If you see the above in Claude Code after sending a prompt, you may need to unset some HTTP proxies.
+In particular, see if HTTP_PROXY is set, and unset it. (In the past ANL has
+recommended `export HTTP_PROXY="http://proxy.alcf.anl.gov:3128"`. This setting can cause
+the issue.)
