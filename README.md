@@ -10,17 +10,7 @@ A lightweight HTTP proxy that lets Claude Code talk to the ALCF Argo API through
 
 ## Quick Start
 
-**1. Configure SSH (one-time)**
-
-Add to `~/.ssh/config` on the login node where you'll run Claude Code:
-
-```
-Host homes.cels.anl.gov
-    ProxyJump <username>@logins.cels.anl.gov
-    User <username>
-```
-
-**2. Run the shim**
+**1. Run the shim**
 
 ```bash
 python3 argo_shim.py
@@ -34,7 +24,7 @@ The shim will:
 
 > If your ALCF username differs from your CELS username, hardcode `API_KEY` at the top of the script.
 
-**3. Start Claude Code** (in another terminal on the same node)
+**2. Start Claude Code** (in another terminal on the same node)
 
 ```bash
 claude
