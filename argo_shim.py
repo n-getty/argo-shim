@@ -4,10 +4,12 @@ import http.client
 import json
 import os
 import secrets
+import signal
 import socket
 import socketserver
 import ssl
 import subprocess
+import threading
 import time
 
 BASE_TUNNEL_PORT = 8080
@@ -329,8 +331,16 @@ if __name__ == "__main__":
     with ThreadedTCPServer(("127.0.0.1", listen_port), ProxyHandler, tunnel_port, auth_token) as httpd:
         print(f"✅ Shim running on {listen_port} -> {tunnel_port}. Supports GET/POST/HEAD.")
 
+        def shutdown_handler(signum, frame):
+            signame = signal.Signals(signum).name
+            print(f"\n{signame} received, shutting down...")
+            threading.Thread(target=httpd.shutdown).start()
+
+        signal.signal(signal.SIGINT, shutdown_handler)
+        signal.signal(signal.SIGTERM, shutdown_handler)
+
         # 5. Run health checks in background after shim is listening
-        import threading
         threading.Thread(target=health_check, args=(tunnel_port, listen_port, auth_token), daemon=True).start()
 
         httpd.serve_forever()
+        print("Shim stopped.")
