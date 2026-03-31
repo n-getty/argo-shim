@@ -1,6 +1,6 @@
 # argo-shim
 
-A lightweight HTTP proxy that lets Claude Code talk to the ALCF Argo API through an SSH tunnel. It handles path rewriting (`/v1/messages` -> `/argoapi/v1/messages`), injects your API key, and bridges plain HTTP (what Claude Code speaks) to HTTPS (what the tunnel carries).
+A lightweight HTTP proxy that lets Claude Code talk to the Argo API through an SSH tunnel from an ALCF machine. It handles path rewriting (`/v1/messages` -> `/argoapi/v1/messages`), injects your API key, and bridges plain HTTP (what Claude Code speaks) to HTTPS (what the tunnel carries).
 
 ## Prerequisites
 
