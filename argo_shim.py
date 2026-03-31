@@ -32,9 +32,9 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         self.handle_proxy("POST")
 
     def handle_proxy(self, method):
-        # Validate auth token
+        # Validate auth token (HEAD is exempt — used by Claude Code as a connectivity probe)
         client_key = self.headers.get('x-api-key', '')
-        if client_key != self.server.auth_token:
+        if method != "HEAD" and client_key != self.server.auth_token:
             self.send_response(401)
             self.send_header('Content-Type', 'text/plain')
             msg = b'Unauthorized: invalid or missing x-api-key'
