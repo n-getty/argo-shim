@@ -88,6 +88,12 @@ kill <pid>
 
 The shim port may have changed. The shim updates `~/.claude/settings.json` automatically, but you need to restart Claude Code to pick up the new port.
 
+**`500: Streaming is required for operations that may take longer than 10 minutes`**
+
+This error comes from Google Vertex AI (the backend hosting Claude behind Argo), not from the shim or Argo Gateway. It occurs when a non-streaming request (`stream: false` or omitted) has a large payload — typically when Claude Code sends tool results (file reads, web searches) back to the model.
+
+The shim works around this by forcing `stream: true` on all POST requests to `/messages` before forwarding upstream. If you see this error, make sure you're running the latest version of the shim.
+
 **"ERROR: The requested URL could not be retrieved" in Claude Code**
 
 If you see the above in Claude Code after sending a prompt, you may need to unset some HTTP proxies in your .bashrc.
