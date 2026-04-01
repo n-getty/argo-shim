@@ -61,6 +61,22 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
         print(f"[{method}] Intercepted Request: {self.path}")
 
+        # Force stream=true on /messages requests to avoid Vertex AI 500 errors.
+        # Vertex rejects non-streaming requests it estimates will exceed 10 minutes.
+        if method == "POST" and body and "/messages" in self.path:
+            try:
+                req_json = json.loads(body)
+                stream_val = req_json.get("stream", "<not set>")
+                model_val = req_json.get("model", "<not set>")
+                if req_json.get("stream") is not True:
+                    print(f"[{method}] /messages: stream={stream_val} -> forcing stream=true (model={model_val})")
+                    req_json["stream"] = True
+                    body = json.dumps(req_json).encode("utf-8")
+                else:
+                    print(f"[{method}] /messages: stream={stream_val}, model={model_val}")
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                print(f"[{method}] /messages: could not parse body, forwarding as-is")
+
         # Path rewrite logic
         path = self.path
         if not path.startswith("/argoapi"):
