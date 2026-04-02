@@ -68,13 +68,13 @@ This creates an SSH tunnel bound to all interfaces and prints the command to run
 argo-shim --tunnel-host <uan-hostname>
 ```
 
-Then start Claude Code:
+Then start Claude Code. If proxy env vars are set (common on HPC nodes), bypass them for localhost:
 
 ```bash
-claude
+no_proxy=localhost,127.0.0.1 NO_PROXY=localhost,127.0.0.1 claude
 ```
 
-The shim automatically sets `no_proxy=localhost,127.0.0.1` in `~/.claude/settings.json` so API traffic bypasses the institutional proxy while internet access (web fetches, package installs) still works.
+The shim prints this command automatically when it detects proxy variables. Without `no_proxy`, the proxy intercepts API traffic to `127.0.0.1` and breaks the connection.
 
 ### Fallback: Relay through your Mac
 

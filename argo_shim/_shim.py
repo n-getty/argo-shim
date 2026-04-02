@@ -523,6 +523,9 @@ def main():
     tunnel_is_remote = bool(args.tunnel_host)
     with ThreadedTCPServer(("127.0.0.1", listen_port), ProxyHandler, tunnel_host, tunnel_port, auth_token, tunnel_is_remote) as httpd:
         print(f"✅ Shim running on {listen_port} -> {tunnel_port}. Supports GET/POST/HEAD.")
+        if os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy"):
+            print(f"\nProxy detected. Start Claude Code with:")
+            print(f"  no_proxy=localhost,127.0.0.1 NO_PROXY=localhost,127.0.0.1 claude")
 
         def shutdown_handler(signum, frame):
             signame = signal.Signals(signum).name
