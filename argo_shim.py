@@ -43,6 +43,18 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         self.handle_proxy("POST")
 
+    def _send_error(self, code, message):
+        """Send an HTTP error response to the client."""
+        try:
+            body = message.encode()
+            self.send_response(code)
+            self.send_header('Content-Type', 'text/plain')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
     def handle_proxy(self, method):
         # Validate auth token (HEAD is exempt — used by Claude Code as a connectivity probe)
         if self.server.auth_token:
@@ -98,10 +110,27 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         headers['x-api-key'] = API_KEY
         headers['Connection'] = 'close'
 
-        try:
-            conn.request(method, path, body=body, headers=headers)
-            response = conn.getresponse()
+        for attempt in range(2):
+            try:
+                conn.request(method, path, body=body, headers=headers)
+                response = conn.getresponse()
+                break
+            except ConnectionRefusedError:
+                conn.close()
+                if attempt == 0 and self.server.recover_tunnel():
+                    print(f"[{method}] Retrying after tunnel recovery...")
+                    conn = http.client.HTTPSConnection(TARGET_HOST, self.server.target_port, context=context, timeout=300)
+                    continue
+                print(f"[{method}] Upstream connection refused (tunnel is down)")
+                self._send_error(502, "Bad Gateway: SSH tunnel is down. Restart argo_shim.")
+                return
+            except Exception as e:
+                conn.close()
+                print(f"[{method}] Upstream error: {e}")
+                self._send_error(502, f"Bad Gateway: {e}")
+                return
 
+        try:
             self.send_response(response.status)
             if response.status >= 400:
                 error_body = response.read()
@@ -126,8 +155,10 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(chunk)
                 self.wfile.flush()
 
+        except (BrokenPipeError, ConnectionResetError):
+            print(f"[{method}] Client disconnected during streaming")
         except Exception as e:
-            print(f"Proxy Error ({method}): {e}")
+            print(f"[{method}] Error during response: {e}")
         finally:
             conn.close()
 
@@ -138,7 +169,23 @@ class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     def __init__(self, server_address, handler, target_port, auth_token):
         self.target_port = target_port
         self.auth_token = auth_token
+        self._tunnel_lock = threading.Lock()
         super().__init__(server_address, handler)
+
+    def recover_tunnel(self):
+        """Attempt to recreate the SSH tunnel. Returns True if recovery succeeded."""
+        with self._tunnel_lock:
+            # Re-check under lock — another thread may have already recovered
+            if find_existing_tunnel(self.target_port):
+                return True
+            print("Tunnel is dead, attempting recovery...")
+            try:
+                create_tunnel(self.target_port)
+                print("Tunnel recovered successfully")
+                return True
+            except Exception as e:
+                print(f"Tunnel recovery failed: {e}")
+                return False
 
 
 def check_port_available(port, host="127.0.0.1"):
@@ -222,7 +269,14 @@ def find_existing_tunnel(port, host="127.0.0.1"):
 def create_tunnel(port, host="127.0.0.1"):
     """Create a new SSH tunnel on the given port and verify it's working."""
     check_port_available(port, host)
-    cmd = ["ssh", "-N", "-f", "-J", f"{API_KEY}@{SSH_PROXY_JUMP}", "-L", f"{port}:{REAL_HOST}:443", f"{API_KEY}@{SSH_JUMP_HOST}"]
+    cmd = [
+        "ssh", "-N", "-f",
+        "-o", "ServerAliveInterval=15",
+        "-o", "ServerAliveCountMax=4",
+        "-J", f"{API_KEY}@{SSH_PROXY_JUMP}",
+        "-L", f"{port}:{REAL_HOST}:443",
+        f"{API_KEY}@{SSH_JUMP_HOST}",
+    ]
     print(f"Creating SSH tunnel on port {port}...")
     print(f"  $ {' '.join(cmd)}")
     result = subprocess.run(cmd)
