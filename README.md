@@ -68,13 +68,13 @@ This creates an SSH tunnel bound to all interfaces and prints the command to run
 argo-shim --tunnel-host <uan-hostname>
 ```
 
-Then start Claude Code:
+Then start Claude Code. If proxy env vars are set (common on HPC nodes), bypass them for localhost:
 
 ```bash
-claude
+no_proxy=localhost,127.0.0.1 NO_PROXY=localhost,127.0.0.1 claude
 ```
 
-The shim automatically clears proxy environment variables in `~/.claude/settings.json`, so no manual unsetting is needed.
+The shim prints this command automatically when it detects proxy variables. Without `no_proxy`, the proxy intercepts API traffic to `127.0.0.1` and breaks the connection.
 
 ### Fallback: Relay through your Mac
 
@@ -184,16 +184,20 @@ The shim works around this by forcing `stream: true` on all POST requests to `/m
 
 **"ERROR: The requested URL could not be retrieved" in Claude Code**
 
-HPC login nodes often set `HTTP_PROXY` / `HTTPS_PROXY` environment variables that route traffic through an institutional proxy, bypassing the shim's localhost proxy entirely. Clear them when launching Claude Code:
+HPC login nodes set `HTTP_PROXY` / `HTTPS_PROXY` environment variables that can interfere with the shim's localhost proxy. The shim handles this automatically by setting `no_proxy=localhost,127.0.0.1` in Claude Code's settings, so API traffic bypasses the proxy while internet access still works.
 
-```bash
-HTTP_PROXY= HTTPS_PROXY= http_proxy= https_proxy= claude
-```
+If you still see proxy errors, ensure you're running the latest version of the shim. See the [ALCF proxy docs](https://docs.alcf.anl.gov/aurora/getting-started-on-aurora/#proxy) for more details.
 
-To make this permanent, unset the proxy vars in your shell config (e.g., `~/.bashrc`):
+## Publishing to PyPI
 
-```bash
-unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy
-```
+Publishing is automated via GitHub Actions. To release a new version:
 
-See the [ALCF proxy docs](https://docs.alcf.anl.gov/aurora/getting-started-on-aurora/#proxy) for more details on proxy settings on Aurora login nodes.
+1. Bump the version in `argo_shim/__init__.py`
+2. Commit and tag:
+   ```bash
+   git commit -am "Bump version to X.Y.Z"
+   git tag vX.Y.Z
+   git push && git push --tags
+   ```
+
+The workflow builds with `uv build` and publishes with `uv publish` using [trusted publishing](https://docs.pypi.org/trusted-publishers/) (no API tokens needed — configure the GitHub repo as a trusted publisher on PyPI).

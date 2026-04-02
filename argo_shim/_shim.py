@@ -177,7 +177,7 @@ class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     def recover_tunnel(self):
         """Attempt to recreate the SSH tunnel. Returns True if recovery succeeded."""
         if self.tunnel_is_remote:
-            # Remote tunnel (--tunnel-host / --relay): can't recreate from here
+            # Remote tunnel (--tunnel-host): can't recreate from here
             print("Tunnel is remote — cannot recover locally. Check the relay or UAN.")
             return False
         with self._tunnel_lock:
@@ -276,7 +276,7 @@ def find_existing_tunnel(port, host="127.0.0.1"):
 
 def create_tunnel(port, host="127.0.0.1", bind_address="127.0.0.1"):
     """Create a new SSH tunnel on the given port and verify it's working."""
-    check_port_available(port, host)
+    check_port_available(port, bind_address)
     cmd = [
         "ssh", "-N", "-f",
         "-o", "ServerAliveInterval=15",
@@ -345,8 +345,19 @@ def update_claude_settings(listen_port, auth_token):
         settings["apiKeyHelper"] = "echo no-auth"
     env = settings.setdefault("env", {})
     env["ANTHROPIC_BASE_URL"] = new_url
+    # Bypass proxy for localhost (argo-shim) while preserving proxy for
+    # internet access (web fetches, package installs, etc.)
+    # Clean up stale empty proxy vars from older versions of argo-shim
     for var in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
-        env[var] = ""
+        if var in env and env[var] == "":
+            del env[var]
+    for var in ("no_proxy", "NO_PROXY"):
+        existing = env.get(var, "")
+        hosts = [h.strip() for h in existing.split(",") if h.strip()] if existing else []
+        for h in ("localhost", "127.0.0.1"):
+            if h not in hosts:
+                hosts.append(h)
+        env[var] = ",".join(hosts)
 
     with open(settings_path, "w") as f:
         json.dump(settings, f, indent=2)
@@ -512,6 +523,11 @@ def main():
     tunnel_is_remote = bool(args.tunnel_host)
     with ThreadedTCPServer(("127.0.0.1", listen_port), ProxyHandler, tunnel_host, tunnel_port, auth_token, tunnel_is_remote) as httpd:
         print(f"✅ Shim running on {listen_port} -> {tunnel_port}. Supports GET/POST/HEAD.")
+        proxy_set = any(os.environ.get(v) for v in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"))
+        no_proxy_hosts = (os.environ.get("NO_PROXY", "") + "," + os.environ.get("no_proxy", "")).strip(",")
+        if proxy_set and not any(h in no_proxy_hosts for h in ("localhost", "127.0.0.1")):
+            print(f"\nProxy detected. Start Claude Code with:")
+            print(f"  no_proxy=localhost,127.0.0.1 NO_PROXY=localhost,127.0.0.1 claude")
 
         def shutdown_handler(signum, frame):
             signame = signal.Signals(signum).name
