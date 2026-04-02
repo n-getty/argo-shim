@@ -388,7 +388,7 @@ def health_check(tunnel_port, listen_port, auth_token):
     return ok
 
 
-if __name__ == "__main__":
+def main():
     parser = argparse.ArgumentParser(description="HTTP proxy shim for Argo API via SSH tunnel")
     parser.add_argument("--no-auth", action="store_true",
                         help="Disable token authentication on the shim (useful when project-level "
@@ -441,3 +441,7 @@ if __name__ == "__main__":
 
         httpd.serve_forever()
         print("Shim stopped.")
+
+
+if __name__ == "__main__":
+    main()

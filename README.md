@@ -2,6 +2,18 @@
 
 A lightweight HTTP proxy that lets Claude Code talk to the Argo API through an SSH tunnel from an ALCF machine. It handles path rewriting (`/v1/messages` -> `/argoapi/v1/messages`), injects your API key, and bridges plain HTTP (what Claude Code speaks) to HTTPS (what the tunnel carries).
 
+## Installation
+
+```bash
+# Run directly (no install needed):
+uvx argo-shim
+
+# Or install globally:
+pip install argo-shim
+# then run:
+argo-shim
+```
+
 ## Prerequisites
 
 - SSH access to CELS machines ([setup guide](https://help.cels.anl.gov/docs/linux/ssh/))
@@ -13,7 +25,7 @@ A lightweight HTTP proxy that lets Claude Code talk to the Argo API through an S
 **1. Run the shim**
 
 ```bash
-python3 argo_shim.py
+argo-shim
 ```
 
 The shim will:
@@ -25,7 +37,7 @@ The shim will:
 To use a specific port instead of the auto-derived one:
 
 ```bash
-python3 argo_shim.py --port 8083
+argo-shim --port 8083
 ```
 
 The tunnel will use the port immediately below (e.g., `--port 8083` → tunnel on 8082, shim on 8083).
@@ -74,7 +86,7 @@ The SSH tunnel is stale, usually caused by SSH ControlMaster keeping a dead conn
 
 ```bash
 ssh -O exit homes.cels.anl.gov
-python3 argo_shim.py   # re-creates the tunnel
+argo-shim   # re-creates the tunnel
 ```
 
 **`HEAD /argoapi HTTP/1.1 501`**
@@ -86,7 +98,7 @@ You're running an older version of the shim that didn't handle HEAD requests. Up
 The shim derives a deterministic port from your username. If that port is taken, specify a different one:
 
 ```bash
-python3 argo_shim.py --port 8083
+argo-shim --port 8083
 ```
 
 To find and kill stale SSH tunnels occupying ports:
@@ -102,7 +114,7 @@ kill <pid>
 
 A few things to check:
 - **Restart Claude Code** after restarting the shim — Claude Code only reads `~/.claude/settings.json` at startup, so it won't pick up a new port or token until restarted.
-- **Try a different port** — in rare cases the derived port may not work on your node. Use `--port <PORT>` to specify an alternative (e.g., `python3 argo_shim.py --port 8083`).
+- **Try a different port** — in rare cases the derived port may not work on your node. Use `--port <PORT>` to specify an alternative (e.g., `argo-shim --port 8083`).
 
 **401 errors / auth failures with project-level Claude settings**
 
@@ -111,7 +123,7 @@ The shim writes `apiKeyHelper` and `ANTHROPIC_BASE_URL` to `~/.claude/settings.j
 Fix: run the shim with `--no-auth` to disable token authentication:
 
 ```bash
-python3 argo_shim.py --no-auth
+argo-shim --no-auth
 ```
 
 This is safe because the shim only listens on `127.0.0.1`. You will still need `ANTHROPIC_BASE_URL` set correctly — either in your global settings (where the shim writes it) or in your project settings.
