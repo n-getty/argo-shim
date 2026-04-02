@@ -119,7 +119,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 conn.close()
                 if attempt == 0 and self.server.recover_tunnel():
                     print(f"[{method}] Retrying after tunnel recovery...")
-                    conn = http.client.HTTPSConnection(TARGET_HOST, self.server.target_port, context=context, timeout=300)
+                    conn = http.client.HTTPSConnection(self.server.target_host, self.server.target_port, context=context, timeout=300)
                     continue
                 print(f"[{method}] Upstream connection refused (tunnel is down)")
                 self._send_error(502, "Bad Gateway: SSH tunnel is down. Restart argo_shim.")
