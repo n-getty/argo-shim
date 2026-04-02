@@ -177,7 +177,7 @@ class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     def recover_tunnel(self):
         """Attempt to recreate the SSH tunnel. Returns True if recovery succeeded."""
         if self.tunnel_is_remote:
-            # Remote tunnel (--tunnel-host / --relay): can't recreate from here
+            # Remote tunnel (--tunnel-host): can't recreate from here
             print("Tunnel is remote — cannot recover locally. Check the relay or UAN.")
             return False
         with self._tunnel_lock:
@@ -276,7 +276,7 @@ def find_existing_tunnel(port, host="127.0.0.1"):
 
 def create_tunnel(port, host="127.0.0.1", bind_address="127.0.0.1"):
     """Create a new SSH tunnel on the given port and verify it's working."""
-    check_port_available(port, host)
+    check_port_available(port, bind_address)
     cmd = [
         "ssh", "-N", "-f",
         "-o", "ServerAliveInterval=15",
