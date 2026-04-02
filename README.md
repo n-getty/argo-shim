@@ -76,6 +76,28 @@ claude
 
 The shim automatically clears proxy environment variables in `~/.claude/settings.json`, so no manual unsetting is needed.
 
+### Fallback: Relay through your Mac
+
+If your UAN cannot SSH to CELS (e.g., network restrictions on Aurora), you can relay the tunnel through your Mac instead. This requires keeping your Mac connected for the duration of the session.
+
+**1. On your Mac:**
+
+```bash
+argo-shim --relay <uan-hostname>
+```
+
+This creates the SSH tunnel locally, reverse-forwards it to the UAN, and starts the local shim (so your Mac can also use Claude Code).
+
+**2. On the compute node:**
+
+```bash
+argo-shim --tunnel-host <uan-hostname>
+```
+
+If the UAN has `GatewayPorts` disabled (the default), the shim will automatically create an SSH local forward from the compute node to the UAN's localhost port.
+
+> **Note:** The relay approach adds an extra network hop (compute node -> UAN -> Mac -> CELS -> API) and depends on your Mac staying connected. Prefer `--tunnel` on the UAN when SSH to CELS is available.
+
 ## Claude Code Settings
 
 The shim automatically creates `~/.claude/settings.json` on first run and keeps the port in `ANTHROPIC_BASE_URL` correct on subsequent runs. No manual setup needed.
