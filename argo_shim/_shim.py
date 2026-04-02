@@ -345,8 +345,15 @@ def update_claude_settings(listen_port, auth_token):
         settings["apiKeyHelper"] = "echo no-auth"
     env = settings.setdefault("env", {})
     env["ANTHROPIC_BASE_URL"] = new_url
-    for var in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
-        env[var] = ""
+    # Bypass proxy for localhost (argo-shim) while preserving proxy for
+    # internet access (web fetches, package installs, etc.)
+    for var in ("no_proxy", "NO_PROXY"):
+        existing = env.get(var, "")
+        hosts = [h.strip() for h in existing.split(",") if h.strip()] if existing else []
+        for h in ("localhost", "127.0.0.1"):
+            if h not in hosts:
+                hosts.append(h)
+        env[var] = ",".join(hosts)
 
     with open(settings_path, "w") as f:
         json.dump(settings, f, indent=2)

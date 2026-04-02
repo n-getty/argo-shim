@@ -74,7 +74,7 @@ Then start Claude Code:
 claude
 ```
 
-The shim automatically clears proxy environment variables in `~/.claude/settings.json`, so no manual unsetting is needed.
+The shim automatically sets `no_proxy=localhost,127.0.0.1` in `~/.claude/settings.json` so API traffic bypasses the institutional proxy while internet access (web fetches, package installs) still works.
 
 ### Fallback: Relay through your Mac
 
@@ -184,19 +184,9 @@ The shim works around this by forcing `stream: true` on all POST requests to `/m
 
 **"ERROR: The requested URL could not be retrieved" in Claude Code**
 
-HPC login nodes often set `HTTP_PROXY` / `HTTPS_PROXY` environment variables that route traffic through an institutional proxy, bypassing the shim's localhost proxy entirely. Clear them when launching Claude Code:
+HPC login nodes set `HTTP_PROXY` / `HTTPS_PROXY` environment variables that can interfere with the shim's localhost proxy. The shim handles this automatically by setting `no_proxy=localhost,127.0.0.1` in Claude Code's settings, so API traffic bypasses the proxy while internet access still works.
 
-```bash
-HTTP_PROXY= HTTPS_PROXY= http_proxy= https_proxy= claude
-```
-
-To make this permanent, unset the proxy vars in your shell config (e.g., `~/.bashrc`):
-
-```bash
-unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy
-```
-
-See the [ALCF proxy docs](https://docs.alcf.anl.gov/aurora/getting-started-on-aurora/#proxy) for more details on proxy settings on Aurora login nodes.
+If you still see proxy errors, ensure you're running the latest version of the shim. See the [ALCF proxy docs](https://docs.alcf.anl.gov/aurora/getting-started-on-aurora/#proxy) for more details.
 
 ## Publishing to PyPI
 
