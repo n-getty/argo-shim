@@ -27,5 +27,11 @@ Issues = "https://github.com/n-getty/argo-shim/issues"
 [project.scripts]
 argo-shim = "argo_shim._shim:main"
 
+[project.optional-dependencies]
+test = ["pytest"]
+
 [tool.hatch.version]
 path = "argo_shim/__init__.py"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -201,8 +201,9 @@ def check_port_available(port, host="127.0.0.1"):
             s.bind((host, port))
         except OSError:
             raise RuntimeError(
-                f"Port {port} is already in use. "
-                f"Use --port <PORT> to specify a different port."
+                f"Port {port} on {host} is already in use.\n"
+                f"  Check what's using it: lsof -i :{port}\n"
+                f"  Or specify a different port: --port <PORT>"
             )
 
 
@@ -458,6 +459,7 @@ def main():
     if args.tunnel:
         # Tunnel-only mode: create a 0.0.0.0-bound tunnel on the UAN and exit
         hostname = socket.gethostname()
+        print(f"Tunnel port {tunnel_port} (listen_port - 1)")
         if find_existing_tunnel(tunnel_port, "0.0.0.0") or find_existing_tunnel(tunnel_port):
             print(f"Tunnel already running on port {tunnel_port}")
         else:
