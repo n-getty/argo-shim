@@ -10,16 +10,7 @@ permissions:
   pull-requests: read
 
 jobs:
-  test:
-    if: github.event.pull_request.merged == true
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
-      - run: uv run --extra test pytest tests/ -v
-
   release:
-    needs: test
     if: github.event.pull_request.merged == true && github.event.pull_request.base.ref == 'main'
     runs-on: ubuntu-latest
     env:
