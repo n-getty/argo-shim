@@ -204,10 +204,13 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # --- Publish steps (both triggers) ---
+      # --- Publish steps ---
+      # On tag push: always publish. On PR merge: skip if release:skip label.
 
       - name: Build package
+        if: github.event_name == 'push' || steps.bump_level.outputs.skip_release != 'true'
         run: uv build
 
       - name: Publish to PyPI
+        if: github.event_name == 'push' || steps.bump_level.outputs.skip_release != 'true'
         run: uv publish

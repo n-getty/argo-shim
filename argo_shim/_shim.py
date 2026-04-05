@@ -221,7 +221,8 @@ def check_port_available(port, host="127.0.0.1"):
             s.bind((host, port))
         except OSError:
             info = _port_in_use_info(port)
-            detail = f"\n  In use by: {info}" if info else ""
+            detail = f"\n  In use by: {info}" if info else \
+                     f"\n  Try: lsof -iTCP:{port} -sTCP:LISTEN"
             raise RuntimeError(
                 f"Port {port} on {host} is already in use.{detail}\n"
                 f"  Use --port <PORT> to specify a different port."
@@ -238,13 +239,16 @@ def _kill_stale_tunnel(port):
         for pid in result.stdout.strip().split('\n'):
             if not pid:
                 continue
-            # Verify it's an ssh process owned by us before killing
+            # Verify it's OUR argo-shim tunnel before killing:
+            # must be owned by us, be an ssh process, and have the expected -L forward
             ps = subprocess.run(
-                ["ps", "-o", "user=,comm=", "-p", pid],
+                ["ps", "-o", "user=,comm=,args=", "-p", pid],
                 capture_output=True, text=True, timeout=5
             )
-            fields = ps.stdout.strip().split()
-            if len(fields) >= 2 and fields[0] == API_KEY and "ssh" in fields[1]:
+            output = ps.stdout.strip()
+            fields = output.split(None, 2)  # user, comm, args
+            if len(fields) >= 3 and fields[0] == API_KEY and "ssh" in fields[1] \
+                    and f"{REAL_HOST}:443" in fields[2]:
                 print(f"  Killing stale SSH tunnel (PID {pid})...")
                 os.kill(int(pid), signal.SIGTERM)
                 time.sleep(1)
@@ -520,7 +524,7 @@ def main():
         # Tunnel-only mode: create a 0.0.0.0-bound tunnel on the UAN and exit
         hostname = socket.gethostname()
         print(f"Tunnel port {tunnel_port} (listen_port - 1)")
-        if find_existing_tunnel(tunnel_port, "0.0.0.0") or find_existing_tunnel(tunnel_port):
+        if find_existing_tunnel(tunnel_port):
             print(f"Tunnel already running on port {tunnel_port}")
         else:
             create_tunnel(tunnel_port, bind_address="0.0.0.0")
