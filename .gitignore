@@ -5,3 +5,4 @@ build/
 .venv/
 .pytest_cache/
 event.json
+uv.lock
