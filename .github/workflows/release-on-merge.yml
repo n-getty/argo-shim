@@ -9,6 +9,10 @@ permissions:
   contents: write
   pull-requests: read
 
+concurrency:
+  group: release-on-merge
+  cancel-in-progress: false
+
 jobs:
   release:
     if: github.event.pull_request.merged == true && github.event.pull_request.base.ref == 'main'
@@ -118,8 +122,9 @@ jobs:
           prev_tag = os.environ.get("PREV_TAG") or ""
 
           log_range = "HEAD" if not prev_tag else f"{prev_tag}..HEAD"
+          SEP = "\x1f"  # unit separator — safe delimiter (cannot appear in subjects)
           raw_commits = subprocess.run(
-              ["git", "log", "--pretty=format:%s|%H", log_range],
+              ["git", "log", f"--pretty=format:%s{SEP}%H", log_range],
               check=True,
               text=True,
               capture_output=True,
@@ -127,9 +132,9 @@ jobs:
 
           commits = []
           for line in raw_commits:
-              if "|" not in line:
+              if SEP not in line:
                   continue
-              subject, commit = line.split("|", 1)
+              subject, commit = line.split(SEP, 1)
               commits.append(f"- {subject} [`{commit[:7]}`](https://github.com/{repo}/commit/{commit})")
 
           if not commits:
@@ -175,6 +180,8 @@ jobs:
           git add argo_shim/__init__.py CHANGELOG.md
           git commit -m "chore: release v${NEW_VERSION}"
           git tag "v${NEW_VERSION}"
+          git fetch origin main
+          git rebase origin/main
           git push origin HEAD:main
           git push origin --tags
 
