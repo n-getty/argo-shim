@@ -229,7 +229,7 @@ def check_port_available(port, host="127.0.0.1"):
             )
 
 
-def _kill_stale_tunnel(port):
+def _kill_stale_tunnel(port, bind_address="127.0.0.1"):
     """Kill a stale SSH tunnel process on the given port. Returns True if port is freed."""
     try:
         result = subprocess.run(
@@ -255,7 +255,7 @@ def _kill_stale_tunnel(port):
                 # Verify it's gone
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                     try:
-                        s.bind(("127.0.0.1", port))
+                        s.bind((bind_address, port))
                         print(f"  ✓ Stale tunnel on port {port} cleaned up")
                         return True
                     except OSError:
@@ -333,7 +333,7 @@ def find_existing_tunnel(port, host="127.0.0.1"):
     # Port is ours but TLS failed — stale tunnel. Try to clean it up
     # so create_tunnel can bind to this port.
     print(f"  Port {port} is not a valid tunnel to {REAL_HOST}")
-    _kill_stale_tunnel(port)
+    _kill_stale_tunnel(port, host)
     return False
 
 
@@ -527,7 +527,17 @@ def main():
         if find_existing_tunnel(tunnel_port):
             print(f"Tunnel already running on port {tunnel_port}")
         else:
-            create_tunnel(tunnel_port, bind_address="0.0.0.0")
+            max_retries = 10 if port_is_auto else 1
+            for attempt in range(max_retries):
+                try:
+                    create_tunnel(tunnel_port, bind_address="0.0.0.0")
+                    break
+                except RuntimeError:
+                    if attempt + 1 >= max_retries:
+                        raise
+                    listen_port += 1
+                    tunnel_port = listen_port - 1
+                    print(f"  Retrying with tunnel port {tunnel_port}...")
             print(f"Tunnel created on port {tunnel_port} (bound to 0.0.0.0)")
         print(f"\nOn the compute node, run:")
         print(f"  argo-shim --tunnel-host {hostname}")
@@ -538,7 +548,17 @@ def main():
         if find_existing_tunnel(tunnel_port):
             print(f"Using existing tunnel on port {tunnel_port}")
         else:
-            create_tunnel(tunnel_port)
+            max_retries = 10 if port_is_auto else 1
+            for attempt in range(max_retries):
+                try:
+                    create_tunnel(tunnel_port)
+                    break
+                except RuntimeError:
+                    if attempt + 1 >= max_retries:
+                        raise
+                    listen_port += 1
+                    tunnel_port = listen_port - 1
+                    print(f"  Retrying with port pair {tunnel_port}/{listen_port}...")
             print(f"Tunnel created on port {tunnel_port}")
         create_reverse_tunnel(args.relay, tunnel_port)
         print(f"\nRelay active: {args.relay}:{tunnel_port} -> localhost:{tunnel_port}")
