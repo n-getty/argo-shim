@@ -194,16 +194,76 @@ class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
                 return False
 
 
+def _port_in_use_info(port):
+    """Return a short description of what's using a port, or None."""
+    try:
+        result = subprocess.run(
+            ["lsof", "-ti", f"TCP:{port}", "-sTCP:LISTEN"],
+            capture_output=True, text=True, timeout=5
+        )
+        for pid in result.stdout.strip().split('\n'):
+            if not pid:
+                continue
+            ps = subprocess.run(
+                ["ps", "-o", "pid=,user=,comm=", "-p", pid],
+                capture_output=True, text=True, timeout=5
+            )
+            return ps.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
 def check_port_available(port, host="127.0.0.1"):
     """Check that a port is available, or raise with a helpful message."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         try:
             s.bind((host, port))
         except OSError:
+            info = _port_in_use_info(port)
+            detail = f"\n  In use by: {info}" if info else \
+                     f"\n  Try: lsof -iTCP:{port} -sTCP:LISTEN"
             raise RuntimeError(
-                f"Port {port} is already in use. "
-                f"Use --port <PORT> to specify a different port."
+                f"Port {port} on {host} is already in use.{detail}\n"
+                f"  Use --port <PORT> to specify a different port."
             )
+
+
+def _kill_stale_tunnel(port, bind_address="127.0.0.1"):
+    """Kill a stale SSH tunnel process on the given port. Returns True if port is freed."""
+    try:
+        result = subprocess.run(
+            ["lsof", "-ti", f"TCP:{port}", "-sTCP:LISTEN"],
+            capture_output=True, text=True, timeout=5
+        )
+        for pid in result.stdout.strip().split('\n'):
+            if not pid:
+                continue
+            # Verify it's OUR argo-shim tunnel before killing:
+            # must be owned by us, be an ssh process, and have the expected -L forward
+            ps = subprocess.run(
+                ["ps", "-o", "user=,comm=,args=", "-p", pid],
+                capture_output=True, text=True, timeout=5
+            )
+            output = ps.stdout.strip()
+            fields = output.split(None, 2)  # user, comm, args
+            if len(fields) >= 3 and fields[0] == API_KEY and "ssh" in fields[1] \
+                    and f"{REAL_HOST}:443" in fields[2]:
+                print(f"  Killing stale SSH tunnel (PID {pid})...")
+                os.kill(int(pid), signal.SIGTERM)
+                time.sleep(1)
+                # Verify it's gone
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    try:
+                        s.bind((bind_address, port))
+                        print(f"  ✓ Stale tunnel on port {port} cleaned up")
+                        return True
+                    except OSError:
+                        print(f"  ✗ Port {port} still in use after killing PID {pid}")
+                        return False
+    except Exception as e:
+        print(f"  Could not clean up port {port}: {e}")
+    return False
 
 
 def verify_tunnel(port, host="127.0.0.1"):
@@ -270,7 +330,10 @@ def find_existing_tunnel(port, host="127.0.0.1"):
     print(f"Port {port} is listening, verifying tunnel...")
     if verify_tunnel(port, host):
         return True
+    # Port is ours but TLS failed — stale tunnel. Try to clean it up
+    # so create_tunnel can bind to this port.
     print(f"  Port {port} is not a valid tunnel to {REAL_HOST}")
+    _kill_stale_tunnel(port, host)
     return False
 
 
@@ -281,6 +344,9 @@ def create_tunnel(port, host="127.0.0.1", bind_address="127.0.0.1"):
         "ssh", "-N", "-f",
         "-o", "ServerAliveInterval=15",
         "-o", "ServerAliveCountMax=4",
+        "-o", "ControlMaster=auto",
+        "-o", f"ControlPath=~/.ssh/argo-shim-%C",
+        "-o", "ControlPersist=yes",
         "-J", f"{API_KEY}@{SSH_PROXY_JUMP}",
         "-L", f"{bind_address}:{port}:{REAL_HOST}:443",
         f"{API_KEY}@{SSH_JUMP_HOST}",
@@ -449,8 +515,10 @@ def main():
 
     if args.port:
         listen_port = args.port
+        port_is_auto = False
     else:
         listen_port = default_port(API_KEY)
+        port_is_auto = True
         print(f"Derived port {listen_port} from username (override with --port <PORT>)")
     tunnel_port = listen_port - 1
     tunnel_host = args.tunnel_host or "127.0.0.1"
@@ -458,10 +526,21 @@ def main():
     if args.tunnel:
         # Tunnel-only mode: create a 0.0.0.0-bound tunnel on the UAN and exit
         hostname = socket.gethostname()
-        if find_existing_tunnel(tunnel_port, "0.0.0.0") or find_existing_tunnel(tunnel_port):
+        print(f"Tunnel port {tunnel_port} (listen_port - 1)")
+        if find_existing_tunnel(tunnel_port):
             print(f"Tunnel already running on port {tunnel_port}")
         else:
-            create_tunnel(tunnel_port, bind_address="0.0.0.0")
+            max_retries = 10 if port_is_auto else 1
+            for attempt in range(max_retries):
+                try:
+                    create_tunnel(tunnel_port, bind_address="0.0.0.0")
+                    break
+                except RuntimeError:
+                    if attempt + 1 >= max_retries:
+                        raise
+                    listen_port += 1
+                    tunnel_port = listen_port - 1
+                    print(f"  Retrying with tunnel port {tunnel_port}...")
             print(f"Tunnel created on port {tunnel_port} (bound to 0.0.0.0)")
         print(f"\nOn the compute node, run:")
         print(f"  argo-shim --tunnel-host {hostname}")
@@ -472,7 +551,17 @@ def main():
         if find_existing_tunnel(tunnel_port):
             print(f"Using existing tunnel on port {tunnel_port}")
         else:
-            create_tunnel(tunnel_port)
+            max_retries = 10 if port_is_auto else 1
+            for attempt in range(max_retries):
+                try:
+                    create_tunnel(tunnel_port)
+                    break
+                except RuntimeError:
+                    if attempt + 1 >= max_retries:
+                        raise
+                    listen_port += 1
+                    tunnel_port = listen_port - 1
+                    print(f"  Retrying with port pair {tunnel_port}/{listen_port}...")
             print(f"Tunnel created on port {tunnel_port}")
         create_reverse_tunnel(args.relay, tunnel_port)
         print(f"\nRelay active: {args.relay}:{tunnel_port} -> localhost:{tunnel_port}")
@@ -505,7 +594,18 @@ def main():
     elif find_existing_tunnel(tunnel_port):
         print(f"Using existing tunnel on port {tunnel_port}")
     else:
-        create_tunnel(tunnel_port)
+        # Auto-retry port pair if derived (not explicit --port)
+        max_retries = 10 if port_is_auto else 1
+        for attempt in range(max_retries):
+            try:
+                create_tunnel(tunnel_port)
+                break
+            except RuntimeError:
+                if attempt + 1 >= max_retries:
+                    raise
+                listen_port += 1
+                tunnel_port = listen_port - 1
+                print(f"  Retrying with port pair {tunnel_port}/{listen_port}...")
         print(f"Tunnel created on port {tunnel_port}")
 
     # 3. Start the shim
