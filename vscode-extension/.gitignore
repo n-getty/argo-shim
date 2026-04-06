@@ -1,0 +1,13 @@
+# Dependencies
+node_modules/
+
+# Compiled Output
+out/
+dist/
+
+# VS Code extension binary packages
+*.vsix
+
+# Operating System Files
+.DS_Store
+Thumbs.db

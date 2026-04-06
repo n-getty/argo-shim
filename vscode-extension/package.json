@@ -1,0 +1,71 @@
+{
+  "name": "argo-shim-remote",
+  "displayName": "Argo-Shim Remote Proxy",
+  "description": "Automatically deploys the argo-shim Python CLI as a secure HTTP proxy to the Argonne Claude API",
+  "version": "0.1.3",
+  "publisher": "sandeepmadireddy",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sandeepmadireddy/argo-shim.git"
+  },
+  "author": "Sandeep Madireddy",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": ["Other"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "Argonne Claude Proxy",
+      "properties": {
+        "argonneClaude.username": {
+          "type": "string",
+          "default": "",
+          "description": "Your Argonne CELS username (e.g. smadireddy)"
+        },
+        "argonneClaude.model": {
+          "type": "string",
+          "default": "opus[1m]",
+          "description": "Claude model to use (e.g. opus[1m], sonnet)"
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "argonne-claude.startProxy",
+        "title": "Argonne: Start Proxy"
+      },
+      {
+        "command": "argonne-claude.stopProxy",
+        "title": "Argonne: Stop Proxy"
+      },
+      {
+        "command": "argonne-claude.checkStatus",
+        "title": "Argonne: Check Proxy Status"
+      },
+      {
+        "command": "argonne-claude.startTunnel",
+        "title": "Argonne: Start SSH Tunnel (Duo 2FA)"
+      },
+      {
+        "command": "argonne-claude.restart",
+        "title": "Argonne: Restart Everything"
+      },
+      {
+        "command": "argonne-claude.configure",
+        "title": "Argonne: Configure Username & API Key"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^18.0.0",
+    "@types/vscode": "^1.80.0",
+    "typescript": "^5.1.3"
+  }
+}
