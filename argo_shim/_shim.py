@@ -265,14 +265,14 @@ def _port_in_use_info(port):
     try:
         result = subprocess.run(
             ["lsof", "-ti", f"TCP:{port}", "-sTCP:LISTEN"],
-            capture_output=True, text=True, timeout=5
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=5
         )
         for pid in result.stdout.strip().split('\n'):
             if not pid:
                 continue
             ps = subprocess.run(
                 ["ps", "-o", "pid=,user=,comm=", "-p", pid],
-                capture_output=True, text=True, timeout=5
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=5
             )
             return ps.stdout.strip()
     except Exception:
@@ -300,7 +300,7 @@ def _kill_stale_tunnel(port, bind_address="127.0.0.1"):
     try:
         result = subprocess.run(
             ["lsof", "-ti", f"TCP:{port}", "-sTCP:LISTEN"],
-            capture_output=True, text=True, timeout=5
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=5
         )
         for pid in result.stdout.strip().split('\n'):
             if not pid:
@@ -309,7 +309,7 @@ def _kill_stale_tunnel(port, bind_address="127.0.0.1"):
             # must be owned by us, be an ssh process, and have the expected -L forward
             ps = subprocess.run(
                 ["ps", "-o", "user=,comm=,args=", "-p", pid],
-                capture_output=True, text=True, timeout=5
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=5
             )
             output = ps.stdout.strip()
             fields = output.split(None, 2)  # user, comm, args
@@ -366,14 +366,14 @@ def is_own_process(port):
         # so TCP@127.0.0.1 and TCP@0.0.0.0 both fail to match wildcard binds.
         result = subprocess.run(
             ["lsof", "-ti", f"TCP:{port}", "-sTCP:LISTEN"],
-            capture_output=True, text=True, timeout=5
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=5
         )
         for pid in result.stdout.strip().split('\n'):
             if not pid:
                 continue
             stat = subprocess.run(
                 ["ps", "-o", "user=", "-p", pid],
-                capture_output=True, text=True, timeout=5
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=5
             )
             owner = stat.stdout.strip()
             if owner == API_KEY:
