@@ -6,3 +6,4 @@ build/
 .pytest_cache/
 event.json
 uv.lock
+CLAUDE.md
