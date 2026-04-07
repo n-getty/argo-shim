@@ -346,11 +346,13 @@ def verify_tunnel(port, host="127.0.0.1"):
             # via server_hostname matching, so reaching here means it passed)
             print(f"  ✓ TLS verified: tunnel on {port} reaches {REAL_HOST}")
             return True
-    except ssl.SSLCertVerificationError as e:
-        print(f"  ✗ Port {port}: TLS cert does not match {REAL_HOST}: {e}")
-        return False
     except ssl.SSLError as e:
-        print(f"  ✗ Port {port}: TLS handshake failed (not a tunnel to a TLS server): {e}")
+        # SSLCertVerificationError is a subclass of SSLError added in 3.7;
+        # on 3.6 we distinguish by checking the verify_code attribute.
+        if getattr(e, 'verify_code', None) or 'CERTIFICATE_VERIFY_FAILED' in str(e):
+            print(f"  ✗ Port {port}: TLS cert does not match {REAL_HOST}: {e}")
+        else:
+            print(f"  ✗ Port {port}: TLS handshake failed (not a tunnel to a TLS server): {e}")
         return False
     except (ConnectionRefusedError, OSError) as e:
         print(f"  ✗ Port {port}: connection failed: {e}")
@@ -620,7 +622,7 @@ def main():
                     print(f"  Retrying with tunnel port {tunnel_port}...")
             print(f"Tunnel created on port {tunnel_port} (bound to 0.0.0.0)")
         print(f"\nOn the compute node, run:")
-        print(f"  argo-shim --tunnel-host {hostname}")
+        print(f"  argo-shim --tunnel-host {hostname} --port {listen_port}")
         return
 
     if args.relay:
@@ -645,7 +647,7 @@ def main():
         create_reverse_tunnel(args.relay, tunnel_port)
         print(f"\nRelay active: {args.relay}:{tunnel_port} -> localhost:{tunnel_port}")
         print(f"\nOn the compute node, run:")
-        print(f"  argo-shim --tunnel-host {args.relay}")
+        print(f"  argo-shim --tunnel-host {args.relay} --port {listen_port}")
         # Continue to start the local shim so Mac can also use Claude
 
     if args.tunnel_host:
