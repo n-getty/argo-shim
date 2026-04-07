@@ -27,6 +27,64 @@ def default_port(username):
 SSH_JUMP_HOST = "homes.cels.anl.gov"
 SSH_PROXY_JUMP = "logins.cels.anl.gov"
 
+MAX_SSH_FAILURES = 3
+
+
+class SSHAuthError(RuntimeError):
+    """Raised when an SSH command fails due to a likely authentication error."""
+    pass
+
+
+class SSHAttemptTracker:
+    """Track consecutive SSH failures to avoid triggering CSPO IP blocks.
+
+    CSPO monitors failed SSH auth attempts to CELS hosts and will block the
+    source IP after too many failures. This tracker stops retrying after
+    MAX_SSH_FAILURES consecutive failures so a single user with broken auth
+    (e.g., closed laptop killing agent forwarding) can't get an entire ALCF
+    login node blocked.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._consecutive_failures = 0
+        self._blocked = False
+
+    def record_success(self):
+        with self._lock:
+            self._consecutive_failures = 0
+            self._blocked = False
+
+    def record_failure(self):
+        with self._lock:
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= MAX_SSH_FAILURES:
+                self._blocked = True
+                print(f"\n⚠ SSH has failed {self._consecutive_failures} consecutive "
+                      f"times. Disabling further SSH attempts to prevent IP blocks.")
+                print(f"  Fix your SSH authentication (ssh-add, reconnect agent "
+                      f"forwarding, etc.) and restart argo-shim.\n")
+            else:
+                remaining = MAX_SSH_FAILURES - self._consecutive_failures
+                print(f"  SSH failure {self._consecutive_failures}/{MAX_SSH_FAILURES} "
+                      f"({remaining} attempt(s) remaining before lockout)")
+
+    def is_blocked(self):
+        with self._lock:
+            return self._blocked
+
+    def check_allowed(self):
+        """Raise SSHAuthError if further SSH attempts are blocked."""
+        if self.is_blocked():
+            raise SSHAuthError(
+                f"SSH retry limit reached ({MAX_SSH_FAILURES} consecutive failures). "
+                f"Fix SSH authentication and restart argo-shim."
+            )
+
+
+_ssh_tracker = SSHAttemptTracker()
+
+
 class ProxyHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
 
@@ -121,8 +179,13 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     print(f"[{method}] Retrying after tunnel recovery...")
                     conn = http.client.HTTPSConnection(self.server.target_host, self.server.target_port, context=context, timeout=300)
                     continue
-                print(f"[{method}] Upstream connection refused (tunnel is down)")
-                self._send_error(502, "Bad Gateway: SSH tunnel is down. Restart argo-shim.")
+                if _ssh_tracker.is_blocked():
+                    print(f"[{method}] SSH retry limit reached — not attempting recovery")
+                    self._send_error(503, "SSH tunnel recovery disabled after repeated auth failures. "
+                                          "Fix SSH authentication and restart argo-shim.")
+                else:
+                    print(f"[{method}] Upstream connection refused (tunnel is down)")
+                    self._send_error(502, "Bad Gateway: SSH tunnel is down. Restart argo-shim.")
                 return
             except Exception as e:
                 conn.close()
@@ -189,6 +252,9 @@ class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
                 create_tunnel(self.target_port)
                 print("Tunnel recovered successfully")
                 return True
+            except SSHAuthError as e:
+                print(f"Tunnel recovery failed: {e}")
+                return False
             except Exception as e:
                 print(f"Tunnel recovery failed: {e}")
                 return False
@@ -339,9 +405,12 @@ def find_existing_tunnel(port, host="127.0.0.1"):
 
 def create_tunnel(port, host="127.0.0.1", bind_address="127.0.0.1"):
     """Create a new SSH tunnel on the given port and verify it's working."""
+    _ssh_tracker.check_allowed()
     check_port_available(port, bind_address)
     cmd = [
         "ssh", "-N", "-f",
+        "-o", "BatchMode=yes",
+        "-o", "ConnectionAttempts=1",
         "-o", "ServerAliveInterval=15",
         "-o", "ServerAliveCountMax=4",
         "-o", "ControlMaster=auto",
@@ -355,7 +424,8 @@ def create_tunnel(port, host="127.0.0.1", bind_address="127.0.0.1"):
     print(f"  $ {' '.join(cmd)}")
     result = subprocess.run(cmd)
     if result.returncode != 0:
-        raise RuntimeError(f"SSH tunnel failed (exit code {result.returncode})")
+        _ssh_tracker.record_failure()
+        raise SSHAuthError(f"SSH tunnel failed (exit code {result.returncode})")
 
     # Wait for tunnel to start accepting connections
     for i in range(10):
@@ -373,17 +443,22 @@ def create_tunnel(port, host="127.0.0.1", bind_address="127.0.0.1"):
     if not verify_tunnel(port, host):
         raise RuntimeError(f"SSH tunnel on port {port} did not verify against {REAL_HOST}")
 
+    _ssh_tracker.record_success()
     return port
 
 
 def create_reverse_tunnel(remote_host, port):
     """Create a reverse SSH tunnel, forwarding remote_host:port to localhost:port."""
-    cmd = ["ssh", "-N", "-f", "-R", f"0.0.0.0:{port}:127.0.0.1:{port}", remote_host]
+    _ssh_tracker.check_allowed()
+    cmd = ["ssh", "-N", "-f",
+           "-o", "BatchMode=yes", "-o", "ConnectionAttempts=1",
+           "-R", f"0.0.0.0:{port}:127.0.0.1:{port}", remote_host]
     print(f"Creating reverse tunnel to {remote_host}:{port}...")
     print(f"  $ {' '.join(cmd)}")
     result = subprocess.run(cmd)
     if result.returncode != 0:
-        raise RuntimeError(f"Reverse SSH tunnel to {remote_host} failed (exit code {result.returncode})")
+        _ssh_tracker.record_failure()
+        raise SSHAuthError(f"Reverse SSH tunnel to {remote_host} failed (exit code {result.returncode})")
 
 
 def update_claude_settings(listen_port, auth_token):
@@ -535,6 +610,8 @@ def main():
                 try:
                     create_tunnel(tunnel_port, bind_address="0.0.0.0")
                     break
+                except SSHAuthError:
+                    raise  # Don't retry on auth failures — risk IP block
                 except RuntimeError:
                     if attempt + 1 >= max_retries:
                         raise
@@ -556,6 +633,8 @@ def main():
                 try:
                     create_tunnel(tunnel_port)
                     break
+                except SSHAuthError:
+                    raise  # Don't retry on auth failures — risk IP block
                 except RuntimeError:
                     if attempt + 1 >= max_retries:
                         raise
@@ -575,13 +654,16 @@ def main():
         if not verify_tunnel(tunnel_port, tunnel_host):
             # Direct connection failed (likely GatewayPorts disabled).
             # Try SSH local forward to reach the remote host's localhost port.
+            _ssh_tracker.check_allowed()
             print(f"  Direct connection failed, creating SSH forward to {tunnel_host}...")
-            fwd_cmd = ["ssh", "-N", "-f", "-L",
-                       f"127.0.0.1:{tunnel_port}:127.0.0.1:{tunnel_port}", tunnel_host]
+            fwd_cmd = ["ssh", "-N", "-f",
+                       "-o", "BatchMode=yes", "-o", "ConnectionAttempts=1",
+                       "-L", f"127.0.0.1:{tunnel_port}:127.0.0.1:{tunnel_port}", tunnel_host]
             print(f"  $ {' '.join(fwd_cmd)}")
             result = subprocess.run(fwd_cmd)
             if result.returncode != 0:
-                raise RuntimeError(f"SSH forward to {tunnel_host} failed (exit code {result.returncode})")
+                _ssh_tracker.record_failure()
+                raise SSHAuthError(f"SSH forward to {tunnel_host} failed (exit code {result.returncode})")
             tunnel_host = "127.0.0.1"
             if not verify_tunnel(tunnel_port, tunnel_host):
                 raise RuntimeError(
@@ -600,6 +682,8 @@ def main():
             try:
                 create_tunnel(tunnel_port)
                 break
+            except SSHAuthError:
+                raise  # Don't retry on auth failures — risk IP block
             except RuntimeError:
                 if attempt + 1 >= max_retries:
                     raise

@@ -126,6 +126,28 @@ curl -k -H "Host: apps.inside.anl.gov" \
 curl -H "x-api-key: <auth-token>" http://127.0.0.1:<shim-port>/v1/models
 ```
 
+## SSH Auth Failure Protection
+
+ALCF and CELS networks are monitored by CSPO (Cyber Security). Too many failed SSH authentication attempts from a single IP will cause CSPO to block that IP — and since multiple users share ALCF login nodes, one user's broken auth can block the entire node for everyone.
+
+The shim protects against this with an **SSH attempt tracker** that counts consecutive SSH failures. After **3 consecutive failures**, all further SSH attempts are disabled and the shim returns `503` errors to clients with a message to fix auth and restart.
+
+Common causes of repeated SSH auth failures:
+- Closing your laptop while SSH agent forwarding is active (kills the forwarded key)
+- Expired Kerberos tickets
+- SSH key removed from the agent (`ssh-add -D`)
+
+When the tracker trips, you'll see:
+
+```
+⚠ SSH has failed 3 consecutive times. Disabling further SSH attempts to prevent IP blocks.
+  Fix your SSH authentication (ssh-add, reconnect agent forwarding, etc.) and restart argo-shim.
+```
+
+To recover: fix your SSH auth (e.g., `ssh-add`, reconnect your laptop, renew tickets), then restart argo-shim. The tracker resets on restart.
+
+All SSH commands also use `BatchMode=yes` (no interactive password fallback) and `ConnectionAttempts=1` to ensure each attempt is a single, non-interactive connection.
+
 ## Troubleshooting
 
 **`[SSL: WRONG_VERSION_NUMBER]` proxy errors**
