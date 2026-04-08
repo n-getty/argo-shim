@@ -296,8 +296,13 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     conn.close()
                     return
                 else:
-                    print(f"[{method}] SSE reassembly failed, response already consumed")
+                    print(f"[{method}] SSE reassembly failed, could not parse upstream response")
+                    self.send_header('Content-Type', 'application/json')
+                    err = json.dumps({"type": "error", "error": {"type": "api_error",
+                        "message": "Shim failed to reassemble streaming response"}}).encode()
+                    self.send_header('Content-Length', str(len(err)))
                     self.end_headers()
+                    self.wfile.write(err)
                     conn.close()
                     return
 
