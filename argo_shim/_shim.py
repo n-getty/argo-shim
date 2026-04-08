@@ -113,6 +113,78 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
+    def _reassemble_sse_to_message(self, response):
+        """Read a streaming SSE response and reassemble into a single message JSON.
+
+        Used when the shim forced stream=true on a request that was originally
+        non-streaming.  The client expects a single JSON object, not SSE events.
+        """
+        message = None
+        content_blocks = {}
+        final_usage = {}
+
+        buf = b""
+        while True:
+            chunk = response.read(4096)
+            if not chunk:
+                break
+            buf += chunk
+
+        text = buf.decode("utf-8", errors="replace")
+        for line in text.split("\n"):
+            line = line.strip()
+            if not line.startswith("data: "):
+                continue
+            data_str = line[6:]
+            if data_str == "[DONE]":
+                break
+            try:
+                event = json.loads(data_str)
+            except json.JSONDecodeError:
+                continue
+
+            etype = event.get("type")
+            if etype == "message_start":
+                message = event.get("message", {})
+            elif etype == "content_block_start":
+                idx = event.get("index", 0)
+                content_blocks[idx] = event.get("content_block", {})
+            elif etype == "content_block_delta":
+                idx = event.get("index", 0)
+                delta = event.get("delta", {})
+                if idx in content_blocks:
+                    if delta.get("type") == "text_delta":
+                        content_blocks[idx]["text"] = (
+                            content_blocks[idx].get("text", "") + delta.get("text", "")
+                        )
+                    elif delta.get("type") == "input_json_delta":
+                        content_blocks[idx].setdefault("input", "")
+                        content_blocks[idx]["input"] += delta.get("partial_json", "")
+            elif etype == "message_delta":
+                delta = event.get("delta", {})
+                if message:
+                    for k in ("stop_reason", "stop_sequence"):
+                        if k in delta:
+                            message[k] = delta[k]
+                usage = event.get("usage", {})
+                if usage:
+                    final_usage.update(usage)
+
+        if message is None:
+            print(f"  SSE reassembly: no message_start found in {len(text)} bytes")
+            if text:
+                print(f"  SSE raw (first 500 chars): {text[:500]}")
+            return None
+
+        if content_blocks:
+            message["content"] = [content_blocks[i] for i in sorted(content_blocks)]
+
+        msg_usage = message.get("usage", {})
+        msg_usage.update(final_usage)
+        message["usage"] = msg_usage
+
+        return message
+
     def handle_proxy(self, method):
         # Validate auth token (HEAD is exempt — used by Claude Code as a connectivity probe)
         if self.server.auth_token:
@@ -140,12 +212,16 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
         # Force stream=true on /messages requests to avoid Vertex AI 500 errors.
         # Vertex rejects non-streaming requests it estimates will exceed 10 minutes.
+        # When we force streaming, we reassemble the SSE response back into a
+        # single JSON object so the client gets the format it originally expected.
+        forced_stream = False
         if method == "POST" and body and "/messages" in self.path:
             try:
                 req_json = json.loads(body)
                 stream_val = req_json.get("stream", "<not set>")
                 model_val = req_json.get("model", "<not set>")
                 if req_json.get("stream") is not True:
+                    forced_stream = True
                     print(f"[{method}] /messages: stream={stream_val} -> forcing stream=true (model={model_val})")
                     req_json["stream"] = True
                     body = json.dumps(req_json).encode("utf-8")
@@ -163,7 +239,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         conn = http.client.HTTPSConnection(self.server.target_host, self.server.target_port, context=context, timeout=300)
 
         # Build headers
-        headers = {k: v for k, v in self.headers.items() if k.lower() not in ['host', 'content-length', 'authorization']}
+        headers = {k: v for k, v in self.headers.items() if k.lower() not in ['host', 'content-length', 'authorization', 'accept-encoding']}
         headers['Host'] = REAL_HOST
         headers['x-api-key'] = API_KEY
         headers['Connection'] = 'close'
@@ -205,6 +281,26 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(error_body)
                 return
+
+            # When we forced stream=true, reassemble the SSE response into a
+            # single JSON message so the client gets the format it expected.
+            if forced_stream and response.status == 200:
+                message = self._reassemble_sse_to_message(response)
+                if message:
+                    response_body = json.dumps(message).encode("utf-8")
+                    self.send_header('Content-Type', 'application/json')
+                    self.send_header('Content-Length', str(len(response_body)))
+                    self.end_headers()
+                    self.wfile.write(response_body)
+                    print(f"[{method}] Reassembled streaming response into non-streaming JSON")
+                    conn.close()
+                    return
+                else:
+                    print(f"[{method}] SSE reassembly failed, response already consumed")
+                    self.end_headers()
+                    conn.close()
+                    return
+
             for k, v in response.getheaders():
                 if k.lower() != 'transfer-encoding':
                     self.send_header(k, v)
