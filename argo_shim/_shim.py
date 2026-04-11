@@ -181,7 +181,13 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
         msg_usage = message.get("usage", {})
         msg_usage.update(final_usage)
+        # Argo's Vertex AI backend may omit input_tokens from SSE events.
+        # Claude Code's model validation checks usage.input_tokens explicitly,
+        # so ensure it's always present.
+        msg_usage.setdefault("input_tokens", 0)
+        msg_usage.setdefault("output_tokens", 0)
         message["usage"] = msg_usage
+        print(f"  SSE reassembly: usage={msg_usage}")
 
         return message
 
