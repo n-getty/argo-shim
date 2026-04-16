@@ -689,11 +689,14 @@ def main():
                              "can reach the API via the UAN.")
     parser.add_argument("--no-update-settings", action="store_true",
                         help="Don't modify ~/.claude/settings.json (useful if you manage settings separately)")
+    parser.add_argument("--direct", action="store_true",
+                        help="Direct mode: connect straight to the Argo API without an SSH tunnel. "
+                             "Use on CELS machines that have direct network access to apps.inside.anl.gov.")
     args = parser.parse_args()
 
-    mode_flags = sum(bool(x) for x in [args.tunnel, args.tunnel_host, args.relay])
+    mode_flags = sum(bool(x) for x in [args.tunnel, args.tunnel_host, args.relay, args.direct])
     if mode_flags > 1:
-        parser.error("--tunnel, --tunnel-host, and --relay are mutually exclusive")
+        parser.error("--tunnel, --tunnel-host, --relay, and --direct are mutually exclusive")
 
     print(f"API key: {API_KEY}")
 
@@ -757,7 +760,13 @@ def main():
         print(f"  argo-shim --tunnel-host {args.relay} --port {listen_port}")
         # Continue to start the local shim so Mac can also use Claude
 
-    if args.tunnel_host:
+    if args.direct:
+        # Direct mode: no tunnel needed, proxy straight to REAL_HOST:443
+        tunnel_host = REAL_HOST
+        tunnel_port = 443
+        print(f"Direct mode: connecting to {REAL_HOST}:443 without SSH tunnel")
+
+    elif args.tunnel_host:
         # Compute node mode: use pre-existing tunnel on remote host
         print(f"Using remote tunnel at {tunnel_host}:{tunnel_port}")
         if not verify_tunnel(tunnel_port, tunnel_host):
@@ -813,9 +822,12 @@ def main():
         update_claude_settings(listen_port, auth_token)
         print(f"Set ANTHROPIC_BASE_URL=http://127.0.0.1:{listen_port}/argoapi")
 
-    tunnel_is_remote = bool(args.tunnel_host)
+    tunnel_is_remote = bool(args.tunnel_host) or args.direct
     with ThreadedTCPServer(("127.0.0.1", listen_port), ProxyHandler, tunnel_host, tunnel_port, auth_token, tunnel_is_remote) as httpd:
-        print(f"✅ Shim running on {listen_port} -> {tunnel_port}. Supports GET/POST/HEAD.")
+        if args.direct:
+            print(f"✅ Shim running on {listen_port} -> {tunnel_host}:{tunnel_port} (direct). Supports GET/POST/HEAD.")
+        else:
+            print(f"✅ Shim running on {listen_port} -> {tunnel_port}. Supports GET/POST/HEAD.")
         proxy_set = any(os.environ.get(v) for v in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"))
         no_proxy_hosts = (os.environ.get("NO_PROXY", "") + "," + os.environ.get("no_proxy", "")).strip(",")
         if proxy_set and not any(h in no_proxy_hosts for h in ("localhost", "127.0.0.1")):
