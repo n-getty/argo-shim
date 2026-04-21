@@ -570,6 +570,20 @@ def create_reverse_tunnel(remote_host, port):
         raise SSHAuthError(f"Reverse SSH tunnel to {remote_host} failed (exit code {result.returncode})")
 
 
+def read_existing_token():
+    """Read the auth token currently stored in settings.json, if any."""
+    settings_path = os.path.expanduser("~/.claude/settings.json")
+    try:
+        with open(settings_path) as f:
+            settings = json.load(f)
+        helper = settings.get("apiKeyHelper", "")
+        if helper.startswith("echo ") and helper[5:] not in ("no-auth", ""):
+            return helper[5:]
+    except Exception:
+        pass
+    return None
+
+
 def update_claude_settings(listen_port, auth_token):
     """Update ~/.claude/settings.json with the correct ANTHROPIC_BASE_URL and auth token."""
     settings_path = os.path.expanduser("~/.claude/settings.json")
@@ -612,7 +626,7 @@ def update_claude_settings(listen_port, auth_token):
     with open(settings_path, "w") as f:
         json.dump(settings, f, indent=2)
         f.write("\n")
-    auth_status = "token rotated" if auth_token else "no auth"
+    auth_status = "auth token set" if auth_token else "no auth"
     print(f"  ✓ Updated settings.json (port={listen_port}, {auth_status})")
     return True
 
@@ -689,6 +703,11 @@ def main():
                              "can reach the API via the UAN.")
     parser.add_argument("--no-update-settings", action="store_true",
                         help="Don't modify ~/.claude/settings.json (useful if you manage settings separately)")
+    parser.add_argument("--tunnel-port", type=int, default=None,
+                        help="Override the tunnel port (default: listen port - 1). Use with --tunnel "
+                             "and --tunnel-host to decouple the tunnel port from the listen port, "
+                             "enabling simultaneous login and compute node shims with a stable "
+                             "settings.json.")
     parser.add_argument("--direct", action="store_true",
                         help="Direct mode: connect straight to the Argo API without an SSH tunnel. "
                              "Use on CELS machines that have direct network access to apps.inside.anl.gov.")
@@ -707,17 +726,19 @@ def main():
         listen_port = default_port(API_KEY)
         port_is_auto = True
         print(f"Derived port {listen_port} from username (override with --port <PORT>)")
-    tunnel_port = listen_port - 1
+    tunnel_port = args.tunnel_port if args.tunnel_port else listen_port - 1
+    tunnel_port_is_auto = args.tunnel_port is None
     tunnel_host = args.tunnel_host or "127.0.0.1"
 
     if args.tunnel:
         # Tunnel-only mode: create a 0.0.0.0-bound tunnel on the UAN and exit
         hostname = socket.gethostname()
-        print(f"Tunnel port {tunnel_port} (listen_port - 1)")
+        print(f"Tunnel port {tunnel_port}" + ("" if args.tunnel_port else " (listen_port - 1)"))
         if find_existing_tunnel(tunnel_port):
             print(f"Tunnel already running on port {tunnel_port}")
         else:
-            max_retries = 10 if port_is_auto else 1
+            # Only auto-retry port increments when both ports are auto-derived
+            max_retries = 10 if (port_is_auto and tunnel_port_is_auto) else 1
             for attempt in range(max_retries):
                 try:
                     create_tunnel(tunnel_port, bind_address="0.0.0.0")
@@ -732,7 +753,7 @@ def main():
                     print(f"  Retrying with tunnel port {tunnel_port}...")
             print(f"Tunnel created on port {tunnel_port} (bound to 0.0.0.0)")
         print(f"\nOn the compute node, run:")
-        print(f"  argo-shim --tunnel-host {hostname} --port {listen_port}")
+        print(f"  argo-shim --tunnel-host {hostname} --port {listen_port} --tunnel-port {tunnel_port}")
         return
 
     if args.relay:
@@ -812,7 +833,13 @@ def main():
 
     # 3. Start the shim
     check_port_available(listen_port)
-    auth_token = None if args.no_auth else secrets.token_urlsafe(32)
+    if args.no_auth:
+        auth_token = None
+    elif args.tunnel_host:
+        # Reuse the login node's token so its shim stays valid — both nodes share settings.json
+        auth_token = read_existing_token() or secrets.token_urlsafe(32)
+    else:
+        auth_token = secrets.token_urlsafe(32)
 
     if args.no_auth:
         print("⚠ Auth disabled (--no-auth): shim accepts unauthenticated requests on localhost")
