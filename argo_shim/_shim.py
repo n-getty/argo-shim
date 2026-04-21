@@ -121,6 +121,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         """
         message = None
         content_blocks = {}
+        input_json_parts = {}  # idx -> accumulated partial_json strings for tool_use blocks
         final_usage = {}
 
         buf = b""
@@ -158,8 +159,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                             content_blocks[idx].get("text", "") + delta.get("text", "")
                         )
                     elif delta.get("type") == "input_json_delta":
-                        content_blocks[idx].setdefault("input", "")
-                        content_blocks[idx]["input"] += delta.get("partial_json", "")
+                        input_json_parts.setdefault(idx, [])
+                        input_json_parts[idx].append(delta.get("partial_json", ""))
             elif etype == "message_delta":
                 delta = event.get("delta", {})
                 if message:
@@ -169,6 +170,15 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 usage = event.get("usage", {})
                 if usage:
                     final_usage.update(usage)
+            elif etype == "error":
+                return event  # SSE error event — return to caller for proper HTTP status
+
+        for idx, parts in input_json_parts.items():
+            if idx in content_blocks:
+                try:
+                    content_blocks[idx]["input"] = json.loads("".join(parts))
+                except json.JSONDecodeError:
+                    content_blocks[idx]["input"] = {}
 
         if message is None:
             print(f"  SSE reassembly: no message_start found in {len(text)} bytes")
@@ -221,11 +231,27 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         # When we force streaming, we reassemble the SSE response back into a
         # single JSON object so the client gets the format it originally expected.
         forced_stream = False
-        if method == "POST" and body and "/messages" in self.path:
+        if method == "POST" and body and "/messages" in self.path and "/messages/" not in self.path:
             try:
                 req_json = json.loads(body)
                 stream_val = req_json.get("stream", "<not set>")
                 model_val = req_json.get("model", "<not set>")
+
+                # Vertex AI rejects thinking blocks with empty content. This happens
+                # when Argo redacts/strips thinking from cached turns but keeps the
+                # block structure. Remove them before forwarding.
+                body_modified = False
+                for msg in req_json.get("messages", []):
+                    content = msg.get("content")
+                    if isinstance(content, list):
+                        cleaned = [b for b in content
+                                   if not (b.get("type") == "thinking" and not b.get("thinking"))]
+                        if len(cleaned) != len(content):
+                            msg["content"] = cleaned
+                            body_modified = True
+                if body_modified:
+                    print(f"[{method}] Stripped empty thinking blocks from request history")
+
                 if req_json.get("stream") is not True:
                     forced_stream = True
                     print(f"[{method}] /messages: stream={stream_val} -> forcing stream=true (model={model_val})")
@@ -233,6 +259,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     body = json.dumps(req_json).encode("utf-8")
                 else:
                     print(f"[{method}] /messages: stream={stream_val}, model={model_val}")
+                    if body_modified:
+                        body = json.dumps(req_json).encode("utf-8")
             except (json.JSONDecodeError, UnicodeDecodeError):
                 print(f"[{method}] /messages: could not parse body, forwarding as-is")
 
@@ -276,6 +304,49 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 return
 
         try:
+            # For forced-stream requests, reassemble the SSE body BEFORE sending
+            # any response headers so we can set the correct HTTP status code.
+            # Upstream may return HTTP 200 with an SSE error event (e.g. 429
+            # quota exceeded), which requires a non-200 status to the client.
+            if forced_stream and response.status == 200:
+                message = self._reassemble_sse_to_message(response)
+                if message and message.get("type") != "error":
+                    response_body = json.dumps(message).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/json')
+                    self.send_header('Content-Length', str(len(response_body)))
+                    self.end_headers()
+                    self.wfile.write(response_body)
+                    print(f"[{method}] Reassembled streaming response into non-streaming JSON")
+                else:
+                    if message:  # SSE error event
+                        error_body = json.dumps(message).encode("utf-8")
+                        err_type = message.get("error", {}).get("type", "")
+                        err_msg = message.get("error", {}).get("message", "")
+                        if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg or "Quota exceeded" in err_msg:
+                            http_status = 429
+                        elif err_type == "overloaded_error" or "overloaded_error" in err_msg:
+                            http_status = 529
+                        elif err_type == "invalid_request_error" or "invalid_request_error" in err_msg or "Error code: 400" in err_msg:
+                            http_status = 400
+                        elif "401" in err_msg or "403" in err_msg or "unauthorized" in err_msg.lower():
+                            http_status = 401
+                        else:
+                            http_status = 503
+                        print(f"[{method}] SSE error (HTTP {http_status}): {err_msg[:200]}")
+                    else:
+                        error_body = json.dumps({"type": "error", "error": {"type": "api_error",
+                            "message": "Shim failed to reassemble streaming response"}}).encode()
+                        http_status = 502
+                        print(f"[{method}] SSE reassembly failed, could not parse upstream response")
+                    self.send_response(http_status)
+                    self.send_header('Content-Type', 'application/json')
+                    self.send_header('Content-Length', str(len(error_body)))
+                    self.end_headers()
+                    self.wfile.write(error_body)
+                conn.close()
+                return
+
             self.send_response(response.status)
             if response.status >= 400:
                 error_body = response.read()
@@ -287,30 +358,6 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(error_body)
                 return
-
-            # When we forced stream=true, reassemble the SSE response into a
-            # single JSON message so the client gets the format it expected.
-            if forced_stream and response.status == 200:
-                message = self._reassemble_sse_to_message(response)
-                if message:
-                    response_body = json.dumps(message).encode("utf-8")
-                    self.send_header('Content-Type', 'application/json')
-                    self.send_header('Content-Length', str(len(response_body)))
-                    self.end_headers()
-                    self.wfile.write(response_body)
-                    print(f"[{method}] Reassembled streaming response into non-streaming JSON")
-                    conn.close()
-                    return
-                else:
-                    print(f"[{method}] SSE reassembly failed, could not parse upstream response")
-                    self.send_header('Content-Type', 'application/json')
-                    err = json.dumps({"type": "error", "error": {"type": "api_error",
-                        "message": "Shim failed to reassemble streaming response"}}).encode()
-                    self.send_header('Content-Length', str(len(err)))
-                    self.end_headers()
-                    self.wfile.write(err)
-                    conn.close()
-                    return
 
             for k, v in response.getheaders():
                 if k.lower() != 'transfer-encoding':
@@ -335,6 +382,15 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     daemon_threads = True
     allow_reuse_address = True
+
+    def handle_error(self, request, client_address):
+        import sys
+        # ConnectionResetError before the request line is read is benign:
+        # Claude Code's HTTP/1.1 connection pool opens connections speculatively
+        # and resets them without sending a request. Suppress the traceback.
+        if sys.exc_info()[0] is ConnectionResetError:
+            return
+        super().handle_error(request, client_address)
 
     def __init__(self, server_address, handler, target_host, target_port, auth_token, tunnel_is_remote=False):
         self.target_host = target_host
