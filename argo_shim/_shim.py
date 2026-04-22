@@ -767,7 +767,14 @@ def main():
     parser.add_argument("--direct", action="store_true",
                         help="Direct mode: connect straight to the Argo API without an SSH tunnel. "
                              "Use on CELS machines that have direct network access to apps.inside.anl.gov.")
+    parser.add_argument("--test", action="store_true",
+                        help="Use the Argo test environment (apps-test.inside.anl.gov) instead of production.")
     args = parser.parse_args()
+
+    if args.test:
+        global REAL_HOST
+        REAL_HOST = "apps-test.inside.anl.gov"
+        print(f"Using test environment: {REAL_HOST}")
 
     mode_flags = sum(bool(x) for x in [args.tunnel, args.tunnel_host, args.relay, args.direct])
     if mode_flags > 1:
