@@ -688,7 +688,7 @@ def update_claude_settings(listen_port, auth_token):
     return True
 
 
-def update_opencode_settings(tunnel_port):
+def update_opencode_settings(tunnel_port, tunnel_host="127.0.0.1"):
     """Update ~/.config/opencode/opencode.json to point the argo provider at the SSH tunnel."""
     try:
         with open(OPENCODE_CONFIG) as f:
@@ -706,7 +706,7 @@ def update_opencode_settings(tunnel_port):
         print(f"  ⚠ No provider.argo.options found in {OPENCODE_CONFIG}")
         return False
 
-    new_url = f"https://127.0.0.1:{tunnel_port}/argoapi/v1"
+    new_url = f"https://{tunnel_host}:{tunnel_port}/argoapi/v1"
     options["baseURL"] = new_url
     headers = options.setdefault("headers", {})
     headers["Host"] = REAL_HOST
@@ -810,9 +810,14 @@ def main():
         REAL_HOST = "apps-test.inside.anl.gov"
         print(f"Using test environment: {REAL_HOST}")
 
-    mode_flags = sum(bool(x) for x in [args.tunnel, args.tunnel_host, args.relay, args.direct, args.opencode])
-    if mode_flags > 1:
-        parser.error("--tunnel, --tunnel-host, --relay, --direct, and --opencode are mutually exclusive")
+    if args.opencode:
+        incompatible = sum(bool(x) for x in [args.tunnel, args.relay, args.direct])
+        if incompatible:
+            parser.error("--opencode cannot be combined with --tunnel, --relay, or --direct")
+    else:
+        mode_flags = sum(bool(x) for x in [args.tunnel, args.tunnel_host, args.relay, args.direct])
+        if mode_flags > 1:
+            parser.error("--tunnel, --tunnel-host, --relay, and --direct are mutually exclusive")
 
     print(f"API key: {API_KEY}")
 
@@ -851,30 +856,57 @@ def main():
             print(f"Tunnel created on port {tunnel_port} (bound to 0.0.0.0)")
         print(f"\nOn the compute node, run:")
         print(f"  argo-shim --tunnel-host {hostname} --port {listen_port} --tunnel-port {tunnel_port}")
+        print(f"\nFor opencode on the compute node, run:")
+        print(f"  argo-shim --opencode --tunnel-host {hostname} --tunnel-port {tunnel_port}")
         return
 
     if args.opencode:
-        # OpenCode mode: create tunnel, update opencode.json, and exit (no shim)
-        print(f"Tunnel port {tunnel_port}" + ("" if args.tunnel_port else " (listen_port - 1)"))
-        if find_existing_tunnel(tunnel_port):
-            print(f"Tunnel already running on port {tunnel_port}")
+        # OpenCode mode: configure opencode.json and exit (no shim)
+        if args.tunnel_host:
+            # Compute node mode: use pre-existing tunnel on remote UAN
+            print(f"Using remote tunnel at {tunnel_host}:{tunnel_port}")
+            oc_tunnel_host = tunnel_host
+            if not verify_tunnel(tunnel_port, tunnel_host):
+                _ssh_tracker.check_allowed()
+                print(f"  Direct connection failed, creating SSH forward to {tunnel_host}...")
+                fwd_cmd = ["ssh", "-N", "-f",
+                           "-o", "BatchMode=yes", "-o", "ConnectionAttempts=1",
+                           "-L", f"127.0.0.1:{tunnel_port}:127.0.0.1:{tunnel_port}", tunnel_host]
+                print(f"  $ {' '.join(fwd_cmd)}")
+                result = subprocess.run(fwd_cmd)
+                if result.returncode != 0:
+                    _ssh_tracker.record_failure()
+                    raise SSHAuthError(f"SSH forward to {tunnel_host} failed (exit code {result.returncode})")
+                oc_tunnel_host = "127.0.0.1"
+                if not verify_tunnel(tunnel_port, oc_tunnel_host):
+                    raise RuntimeError(
+                        f"No valid tunnel found at {args.tunnel_host}:{tunnel_port} "
+                        f"(tried direct and SSH forward). "
+                        f"Ensure argo-shim --tunnel is running on the UAN."
+                    )
         else:
-            max_retries = 10 if (port_is_auto and tunnel_port_is_auto) else 1
-            for attempt in range(max_retries):
-                try:
-                    create_tunnel(tunnel_port)
-                    break
-                except SSHAuthError:
-                    raise
-                except RuntimeError:
-                    if attempt + 1 >= max_retries:
+            # Local mode: create tunnel on this machine
+            print(f"Tunnel port {tunnel_port}" + ("" if args.tunnel_port else " (listen_port - 1)"))
+            if find_existing_tunnel(tunnel_port):
+                print(f"Tunnel already running on port {tunnel_port}")
+            else:
+                max_retries = 10 if (port_is_auto and tunnel_port_is_auto) else 1
+                for attempt in range(max_retries):
+                    try:
+                        create_tunnel(tunnel_port)
+                        break
+                    except SSHAuthError:
                         raise
-                    listen_port += 1
-                    tunnel_port = listen_port - 1
-                    print(f"  Retrying with tunnel port {tunnel_port}...")
-            print(f"Tunnel created on port {tunnel_port}")
-        update_opencode_settings(tunnel_port)
-        print(f"\nThe tunnel's TLS cert is for {REAL_HOST}, not 127.0.0.1.")
+                    except RuntimeError:
+                        if attempt + 1 >= max_retries:
+                            raise
+                        listen_port += 1
+                        tunnel_port = listen_port - 1
+                        print(f"  Retrying with tunnel port {tunnel_port}...")
+                print(f"Tunnel created on port {tunnel_port}")
+            oc_tunnel_host = "127.0.0.1"
+        update_opencode_settings(tunnel_port, oc_tunnel_host)
+        print(f"\nThe tunnel's TLS cert is for {REAL_HOST}, not {oc_tunnel_host}.")
         print(f"Start opencode with TLS verification disabled:")
         print(f"  NODE_TLS_REJECT_UNAUTHORIZED=0 opencode")
         return
