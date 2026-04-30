@@ -17,6 +17,7 @@ import time
 TARGET_HOST = "127.0.0.1"
 REAL_HOST = "apps.inside.anl.gov"
 API_KEY = os.environ.get("CELS_USERNAME", getpass.getuser())
+OPENCODE_CONFIG = os.path.expanduser("~/.config/opencode/opencode.json")
 
 
 def default_port(username):
@@ -687,6 +688,36 @@ def update_claude_settings(listen_port, auth_token):
     return True
 
 
+def update_opencode_settings(tunnel_port):
+    """Update ~/.config/opencode/opencode.json to point the argo provider at the SSH tunnel."""
+    try:
+        with open(OPENCODE_CONFIG) as f:
+            config = json.load(f)
+    except FileNotFoundError:
+        print(f"  ✗ opencode config not found: {OPENCODE_CONFIG}")
+        return False
+    except json.JSONDecodeError as e:
+        print(f"  ⚠ Could not parse {OPENCODE_CONFIG}: {e}")
+        return False
+
+    try:
+        options = config["provider"]["argo"]["options"]
+    except KeyError:
+        print(f"  ⚠ No provider.argo.options found in {OPENCODE_CONFIG}")
+        return False
+
+    new_url = f"https://127.0.0.1:{tunnel_port}/argoapi/v1"
+    options["baseURL"] = new_url
+    headers = options.setdefault("headers", {})
+    headers["Host"] = REAL_HOST
+    with open(OPENCODE_CONFIG, "w") as f:
+        json.dump(config, f, indent=2)
+        f.write("\n")
+    print(f"  ✓ Updated opencode.json baseURL -> {new_url}")
+    print(f"  ✓ Set Host header -> {REAL_HOST}")
+    return True
+
+
 def health_check(tunnel_host, tunnel_port, listen_port, auth_token):
     """Validate the full chain: tunnel -> remote endpoint, and shim -> tunnel."""
     print("\nRunning health checks...")
@@ -769,6 +800,9 @@ def main():
                              "Use on CELS machines that have direct network access to apps.inside.anl.gov.")
     parser.add_argument("--test", action="store_true",
                         help="Use the Argo test environment (apps-test.inside.anl.gov) instead of production.")
+    parser.add_argument("--opencode", action="store_true",
+                        help="Configure opencode to use the SSH tunnel (updates opencode.json) and exit. "
+                             "Does not start the shim.")
     args = parser.parse_args()
 
     if args.test:
@@ -776,9 +810,9 @@ def main():
         REAL_HOST = "apps-test.inside.anl.gov"
         print(f"Using test environment: {REAL_HOST}")
 
-    mode_flags = sum(bool(x) for x in [args.tunnel, args.tunnel_host, args.relay, args.direct])
+    mode_flags = sum(bool(x) for x in [args.tunnel, args.tunnel_host, args.relay, args.direct, args.opencode])
     if mode_flags > 1:
-        parser.error("--tunnel, --tunnel-host, --relay, and --direct are mutually exclusive")
+        parser.error("--tunnel, --tunnel-host, --relay, --direct, and --opencode are mutually exclusive")
 
     print(f"API key: {API_KEY}")
 
@@ -817,6 +851,32 @@ def main():
             print(f"Tunnel created on port {tunnel_port} (bound to 0.0.0.0)")
         print(f"\nOn the compute node, run:")
         print(f"  argo-shim --tunnel-host {hostname} --port {listen_port} --tunnel-port {tunnel_port}")
+        return
+
+    if args.opencode:
+        # OpenCode mode: create tunnel, update opencode.json, and exit (no shim)
+        print(f"Tunnel port {tunnel_port}" + ("" if args.tunnel_port else " (listen_port - 1)"))
+        if find_existing_tunnel(tunnel_port):
+            print(f"Tunnel already running on port {tunnel_port}")
+        else:
+            max_retries = 10 if (port_is_auto and tunnel_port_is_auto) else 1
+            for attempt in range(max_retries):
+                try:
+                    create_tunnel(tunnel_port)
+                    break
+                except SSHAuthError:
+                    raise
+                except RuntimeError:
+                    if attempt + 1 >= max_retries:
+                        raise
+                    listen_port += 1
+                    tunnel_port = listen_port - 1
+                    print(f"  Retrying with tunnel port {tunnel_port}...")
+            print(f"Tunnel created on port {tunnel_port}")
+        update_opencode_settings(tunnel_port)
+        print(f"\nThe tunnel's TLS cert is for {REAL_HOST}, not 127.0.0.1.")
+        print(f"Start opencode with TLS verification disabled:")
+        print(f"  NODE_TLS_REJECT_UNAUTHORIZED=0 opencode")
         return
 
     if args.relay:
