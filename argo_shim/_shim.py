@@ -582,10 +582,13 @@ def create_tunnel(port, host="127.0.0.1", bind_address="127.0.0.1"):
         "-o", "ControlMaster=auto",
         "-o", f"ControlPath=~/.ssh/argo-shim-%C",
         "-o", "ControlPersist=yes",
-        "-J", f"{API_KEY}@{SSH_PROXY_JUMP}",
+    ]
+    if SSH_PROXY_JUMP:
+        cmd.extend(["-J", f"{API_KEY}@{SSH_PROXY_JUMP}"])
+    cmd.extend([
         "-L", f"{bind_address}:{port}:{REAL_HOST}:443",
         f"{API_KEY}@{SSH_JUMP_HOST}",
-    ]
+    ])
     print(f"Creating SSH tunnel on port {port}...")
     print(f"  $ {' '.join(cmd)}")
     result = subprocess.run(cmd)
@@ -803,12 +806,24 @@ def main():
     parser.add_argument("--opencode", action="store_true",
                         help="Configure opencode to use the SSH tunnel (updates opencode.json) and exit. "
                              "Does not start the shim.")
+    parser.add_argument("--host", default=None,
+                        help="Set the SSH_JUMP_HOST to a different machine (default: homes.cels.anl.gov)")
+    parser.add_argument("--nojump", action="store_true",
+                        help="Make a direct connection to the host rather than jumping through SSH_PROXY_JUMP")
     args = parser.parse_args()
 
+    global REAL_HOST, SSH_JUMP_HOST, SSH_PROXY_JUMP
+
     if args.test:
-        global REAL_HOST
         REAL_HOST = "apps-test.inside.anl.gov"
         print(f"Using test environment: {REAL_HOST}")
+
+    if args.host:
+        SSH_JUMP_HOST = args.host
+        print(f"Using jump host: {SSH_JUMP_HOST}")
+    if args.nojump:
+        SSH_PROXY_JUMP = None
+        print("Disabling proxy jump")
 
     if args.opencode:
         incompatible = sum(bool(x) for x in [args.tunnel, args.relay, args.direct])
