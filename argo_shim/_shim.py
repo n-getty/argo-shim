@@ -273,8 +273,11 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         context = ssl._create_unverified_context()
         conn = http.client.HTTPSConnection(self.server.target_host, self.server.target_port, context=context, timeout=300)
 
-        # Build headers
-        headers = {k: v for k, v in self.headers.items() if k.lower() not in ['host', 'content-length', 'authorization', 'accept-encoding']}
+        # Build headers. Strip case variants of headers we set ourselves —
+        # Python dicts are case-sensitive, so a client sending "X-Api-Key"
+        # would otherwise leak its own token alongside our injected one.
+        _strip = {'host', 'content-length', 'authorization', 'accept-encoding', 'x-api-key', 'connection'}
+        headers = {k: v for k, v in self.headers.items() if k.lower() not in _strip}
         headers['Host'] = REAL_HOST
         headers['x-api-key'] = API_KEY
         headers['Connection'] = 'close'
