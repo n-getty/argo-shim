@@ -27,8 +27,14 @@ def default_port(username):
 
 SSH_JUMP_HOST = "homes.cels.anl.gov"
 SSH_PROXY_JUMP = "logins.cels.anl.gov"
+SSH_VERBOSITY = 0
 
 MAX_SSH_FAILURES = 3
+
+
+def _ssh_verbose_flags():
+    """Return a list like ['-vvv'] for the current verbosity level, or [] if quiet."""
+    return [f"-{'v' * SSH_VERBOSITY}"] if SSH_VERBOSITY > 0 else []
 
 
 class SSHAuthError(RuntimeError):
@@ -578,6 +584,7 @@ def create_tunnel(port, host="127.0.0.1", bind_address="127.0.0.1"):
     check_port_available(port, bind_address)
     cmd = [
         "ssh", "-N", "-f",
+        *_ssh_verbose_flags(),
         "-o", "BatchMode=yes",
         "-o", "ConnectionAttempts=1",
         "-o", "ServerAliveInterval=15",
@@ -623,6 +630,7 @@ def create_reverse_tunnel(remote_host, port):
     """Create a reverse SSH tunnel, forwarding remote_host:port to localhost:port."""
     _ssh_tracker.check_allowed()
     cmd = ["ssh", "-N", "-f",
+           *_ssh_verbose_flags(),
            "-o", "BatchMode=yes", "-o", "ConnectionAttempts=1",
            "-R", f"0.0.0.0:{port}:127.0.0.1:{port}", remote_host]
     print(f"Creating reverse tunnel to {remote_host}:{port}...")
@@ -813,9 +821,14 @@ def main():
                         help="Set the SSH_JUMP_HOST to a different machine (default: homes.cels.anl.gov)")
     parser.add_argument("--nojump", action="store_true",
                         help="Make a direct connection to the host rather than jumping through SSH_PROXY_JUMP")
+    parser.add_argument("-v", "--verbose", action="count", default=0,
+                        help="Pass -v (or -vv, -vvv) through to every ssh command. Repeat for more verbosity.")
     args = parser.parse_args()
 
-    global REAL_HOST, SSH_JUMP_HOST, SSH_PROXY_JUMP
+    global REAL_HOST, SSH_JUMP_HOST, SSH_PROXY_JUMP, SSH_VERBOSITY
+    SSH_VERBOSITY = min(args.verbose, 3)
+    if SSH_VERBOSITY:
+        print(f"SSH verbosity: -{'v' * SSH_VERBOSITY}")
 
     if args.test:
         REAL_HOST = "apps-test.inside.anl.gov"
@@ -888,6 +901,7 @@ def main():
                 _ssh_tracker.check_allowed()
                 print(f"  Direct connection failed, creating SSH forward to {tunnel_host}...")
                 fwd_cmd = ["ssh", "-N", "-f",
+                           *_ssh_verbose_flags(),
                            "-o", "BatchMode=yes", "-o", "ConnectionAttempts=1",
                            "-L", f"127.0.0.1:{tunnel_port}:127.0.0.1:{tunnel_port}", tunnel_host]
                 print(f"  $ {' '.join(fwd_cmd)}")
@@ -969,6 +983,7 @@ def main():
             _ssh_tracker.check_allowed()
             print(f"  Direct connection failed, creating SSH forward to {tunnel_host}...")
             fwd_cmd = ["ssh", "-N", "-f",
+                       *_ssh_verbose_flags(),
                        "-o", "BatchMode=yes", "-o", "ConnectionAttempts=1",
                        "-L", f"127.0.0.1:{tunnel_port}:127.0.0.1:{tunnel_port}", tunnel_host]
             print(f"  $ {' '.join(fwd_cmd)}")
