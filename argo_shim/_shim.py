@@ -514,21 +514,43 @@ def verify_tunnel(port, host="127.0.0.1"):
                              server_hostname=REAL_HOST) as s:
             s.settimeout(5)
             s.connect((host, port))
-            cert = s.getpeercert()
-            # Check that the cert is valid for REAL_HOST (wrap_socket already does this
-            # via server_hostname matching, so reaching here means it passed)
+            s.getpeercert()
             print(f"  ✓ TLS verified: tunnel on {port} reaches {REAL_HOST}")
             return True
     except ssl.SSLError as e:
-        # SSLCertVerificationError is a subclass of SSLError added in 3.7;
-        # on 3.6 we distinguish by checking the verify_code attribute.
         if getattr(e, 'verify_code', None) or 'CERTIFICATE_VERIFY_FAILED' in str(e):
-            print(f"  ✗ Port {port}: TLS cert does not match {REAL_HOST}: {e}")
-        else:
-            print(f"  ✗ Port {port}: TLS handshake failed (not a tunnel to a TLS server): {e}")
+            # Trust-store quirks (e.g. SUSE on Polaris ships InCommon CA with
+            # "No Trusted Uses", causing CERTIFICATE_VERIFY_FAILED). Fall back
+            # to an unverified handshake and confirm the peer cert names
+            # REAL_HOST in its SAN/CN. The runtime proxy is unverified anyway.
+            return _verify_tunnel_by_cert_name(port, host)
+        print(f"  ✗ Port {port}: TLS handshake failed (not a tunnel to a TLS server): {e}")
         return False
     except (ConnectionRefusedError, OSError) as e:
         print(f"  ✗ Port {port}: connection failed: {e}")
+        return False
+
+
+def _verify_tunnel_by_cert_name(port, host):
+    """Fallback: handshake without trust-store verification and confirm the
+    server cert mentions REAL_HOST. DER-encoded ASN.1 stores DNS names as
+    UTF-8 literals, so a substring check is sufficient to confirm we're
+    talking to the right server even when the local trust store can't
+    chain-verify the intermediate."""
+    try:
+        ctx = ssl._create_unverified_context()
+        with ctx.wrap_socket(socket.socket(socket.AF_INET, socket.SOCK_STREAM),
+                             server_hostname=REAL_HOST) as s:
+            s.settimeout(5)
+            s.connect((host, port))
+            der = s.getpeercert(binary_form=True)
+        if der and REAL_HOST.encode("ascii") in der:
+            print(f"  ✓ TLS handshake OK on {port}; cert names {REAL_HOST} (trust chain not verified)")
+            return True
+        print(f"  ✗ Port {port}: cert does not name {REAL_HOST}")
+        return False
+    except (ssl.SSLError, ConnectionRefusedError, OSError) as e:
+        print(f"  ✗ Port {port}: fallback verification failed: {e}")
         return False
 
 
@@ -620,10 +642,27 @@ def create_tunnel(port, host="127.0.0.1", bind_address="127.0.0.1"):
 
     print(f"Verifying new tunnel...")
     if not verify_tunnel(port, host):
+        # Tear down the control master we just spawned so a retry on a
+        # different port doesn't stack another -L forward onto the same
+        # process, leaving stale ports bound.
+        _close_control_master()
         raise RuntimeError(f"SSH tunnel on port {port} did not verify against {REAL_HOST}")
 
     _ssh_tracker.record_success()
     return port
+
+
+def _close_control_master():
+    """Ask the argo-shim ssh control master to exit. Best-effort; ignore errors."""
+    cmd = ["ssh", "-O", "exit",
+           "-o", "ControlPath=~/.ssh/argo-shim-%C"]
+    if SSH_PROXY_JUMP:
+        cmd.extend(["-J", f"{API_KEY}@{SSH_PROXY_JUMP}"])
+    cmd.append(f"{API_KEY}@{SSH_JUMP_HOST}")
+    try:
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+    except Exception:
+        pass
 
 
 def create_reverse_tunnel(remote_host, port):

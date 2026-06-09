@@ -1,3 +1,3 @@
 """argo-shim: HTTP proxy for Argo API via SSH tunnel."""
 
-__version__ = "0.3.12"
+__version__ = "0.3.13"
