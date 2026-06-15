@@ -11,6 +11,7 @@ import socket
 import socketserver
 import ssl
 import subprocess
+import sys
 import threading
 import time
 
@@ -18,6 +19,8 @@ TARGET_HOST = "127.0.0.1"
 REAL_HOST = "apps.inside.anl.gov"
 API_KEY = os.environ.get("CELS_USERNAME", getpass.getuser())
 OPENCODE_CONFIG = os.path.expanduser("~/.config/opencode/opencode.json")
+STATE_PATH = os.path.expanduser("~/.claude/argo-shim-state.json")
+ACCOUNTS_URL = "https://accounts.cels.anl.gov"
 
 
 def default_port(username):
@@ -29,12 +32,101 @@ SSH_JUMP_HOST = "homes.cels.anl.gov"
 SSH_PROXY_JUMP = "logins.cels.anl.gov"
 SSH_VERBOSITY = 0
 
-MAX_SSH_FAILURES = 3
+# Failure/lockout policy. Retries to CELS rarely change the outcome (a broken
+# key stays broken) but each failed auth pushes the shared login-node IP closer
+# to a CSPO block, so we keep these deliberately small.
+MAX_SSH_FAILURES = 2        # consecutive auth-type failures before a cooldown
+COOLDOWN_SECONDS = 900      # 15-minute timed cooldown after MAX_SSH_FAILURES
+MAX_COOLDOWN_CYCLES = 2     # cooldowns endured before escalating to a hard lock
+
+# SSH failure classifications. Only these "kinds" count toward the lockout —
+# a network outage or a busy local port is not a failed authentication and
+# must not push us toward a CSPO IP block.
+_LOCKOUT_KINDS = {"auth", "host_key", "unknown"}
 
 
 def _ssh_verbose_flags():
     """Return a list like ['-vvv'] for the current verbosity level, or [] if quiet."""
     return [f"-{'v' * SSH_VERBOSITY}"] if SSH_VERBOSITY > 0 else []
+
+
+# Substring signatures keyed by failure kind, checked in priority order. Matching
+# is case-insensitive. host_key/auth are checked before network because a stale
+# host key or rejected key is the actionable problem even if a generic timeout
+# line also appears.
+_SSH_ERROR_SIGNATURES = [
+    ("host_key", [
+        "host key verification failed",
+        "remote host identification has changed",
+        "no matching host key type",
+    ]),
+    ("auth", [
+        "permission denied",
+        "publickey",
+        "too many authentication failures",
+        "no mutual signature algorithm",
+        "authentication failed",
+        "unable to negotiate",
+    ]),
+    ("network", [
+        "connection timed out",
+        "connection refused",
+        "could not resolve hostname",
+        "network is unreachable",
+        "operation timed out",
+        "no route to host",
+        "name or service not known",
+    ]),
+    ("port", [
+        "address already in use",
+        "cannot listen to port",
+        "bind: ",
+        "remote port forwarding failed",
+    ]),
+]
+
+_SSH_ERROR_HINTS = {
+    "auth": (
+        "CELS rejected your SSH key (authentication failed).\n"
+        "  1. Make sure your PUBLIC key is uploaded at " + ACCOUNTS_URL + "\n"
+        "  2. Load it into your agent:  ssh-add\n"
+        "  3. Verify by hand:  ssh -o BatchMode=yes " + SSH_PROXY_JUMP + " true\n"
+        "  Do NOT keep restarting argo-shim until that test succeeds — repeated\n"
+        "  failed logins can get this login node's IP blocked for everyone."
+    ),
+    "host_key": (
+        "SSH host-key verification failed for a CELS host.\n"
+        "  If you were warned the host identity changed, inspect ~/.ssh/known_hosts\n"
+        "  and remove the stale entry only if you trust the change, then retry once."
+    ),
+    "network": (
+        "Could not reach CELS over the network (not an auth problem).\n"
+        "  Check your connection / VPN and that " + SSH_PROXY_JUMP + " is reachable.\n"
+        "  This was NOT counted as an auth failure."
+    ),
+    "port": (
+        "A local port was unavailable for the tunnel.\n"
+        "  Pick another with  --port <PORT>  (this is not an SSH auth failure)."
+    ),
+    "unknown": (
+        "SSH failed for an unrecognized reason — see the ssh output above.\n"
+        "  Re-run with -v for detail. Avoid repeated restarts until you know why."
+    ),
+}
+
+
+def _classify_ssh_error(stderr_text):
+    """Classify ssh stderr into a (kind, hint) tuple.
+
+    kind is one of auth/host_key/network/port/unknown. Only the kinds in
+    _LOCKOUT_KINDS count toward the persistent lockout; network/port are
+    transient and must not push the shared IP toward a CSPO block.
+    """
+    text = (stderr_text or "").lower()
+    for kind, needles in _SSH_ERROR_SIGNATURES:
+        if any(n in text for n in needles):
+            return kind, _SSH_ERROR_HINTS[kind]
+    return "unknown", _SSH_ERROR_HINTS["unknown"]
 
 
 class SSHAuthError(RuntimeError):
@@ -43,50 +135,168 @@ class SSHAuthError(RuntimeError):
 
 
 class SSHAttemptTracker:
-    """Track consecutive SSH failures to avoid triggering CSPO IP blocks.
+    """Track SSH failures *across restarts* to avoid triggering CSPO IP blocks.
 
     CSPO monitors failed SSH auth attempts to CELS hosts and will block the
-    source IP after too many failures. This tracker stops retrying after
-    MAX_SSH_FAILURES consecutive failures so a single user with broken auth
-    (e.g., closed laptop killing agent forwarding) can't get an entire ALCF
-    login node blocked.
+    source IP after too many failures. Because ALCF login nodes are shared, one
+    user with broken auth can get the whole node blocked for everyone.
+
+    The earlier version of this tracker lived only in memory, so a confused user
+    could Ctrl-C and re-run argo-shim to reset the counter and hammer CELS
+    indefinitely — exactly the failure mode that prompted this rewrite. State now
+    persists to STATE_PATH, so restarting does NOT bypass the lockout.
+
+    Policy is hybrid:
+      - Each auth-type failure increments a consecutive counter.
+      - After MAX_SSH_FAILURES, enter a timed cooldown (COOLDOWN_SECONDS) during
+        which all SSH attempts are refused. The cooldown clears itself.
+      - If the user keeps failing across MAX_COOLDOWN_CYCLES cooldowns, escalate
+        to a hard lock that only `argo-shim --reset` (after fixing auth) clears.
+    Only failures whose kind is in _LOCKOUT_KINDS advance this state; transient
+    network/port failures do not.
     """
+
+    _CLEAN = {
+        "consecutive_failures": 0,
+        "cooldown_cycles": 0,
+        "locked_until": 0.0,
+        "hard_locked": False,
+        "last_kind": "",
+        "last_time": 0.0,
+    }
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._consecutive_failures = 0
-        self._blocked = False
+
+    def _load(self):
+        """Read state from disk; tolerate a missing or corrupt file."""
+        try:
+            with open(STATE_PATH) as f:
+                data = json.load(f)
+            state = dict(self._CLEAN)
+            for k in self._CLEAN:
+                if k in data:
+                    state[k] = data[k]
+            return state
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return dict(self._CLEAN)
+
+    def _save(self, state):
+        try:
+            os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
+            with open(STATE_PATH, "w") as f:
+                json.dump(state, f, indent=2)
+                f.write("\n")
+        except OSError as e:
+            print(f"  ⚠ Could not write lockout state to {STATE_PATH}: {e}")
 
     def record_success(self):
+        """Clear all failure state — we got a working tunnel."""
         with self._lock:
-            self._consecutive_failures = 0
-            self._blocked = False
+            try:
+                if os.path.exists(STATE_PATH):
+                    os.remove(STATE_PATH)
+            except OSError:
+                self._save(dict(self._CLEAN))
 
-    def record_failure(self):
+    def record_failure(self, kind="unknown"):
+        """Record an SSH failure of the given kind. Returns the updated state.
+
+        Only kinds in _LOCKOUT_KINDS advance the lockout; others are noted but
+        do not count toward a cooldown or hard lock.
+        """
         with self._lock:
-            self._consecutive_failures += 1
-            if self._consecutive_failures >= MAX_SSH_FAILURES:
-                self._blocked = True
-                print(f"\n⚠ SSH has failed {self._consecutive_failures} consecutive "
-                      f"times. Disabling further SSH attempts to prevent IP blocks.")
-                print(f"  Fix your SSH authentication (ssh-add, reconnect agent "
-                      f"forwarding, etc.) and restart argo-shim.\n")
+            state = self._load()
+            state["last_kind"] = kind
+            state["last_time"] = time.time()
+
+            if kind not in _LOCKOUT_KINDS:
+                print(f"  SSH failure ({kind}) — not an auth failure, not counted "
+                      f"toward the lockout.")
+                self._save(state)
+                return state
+
+            state["consecutive_failures"] += 1
+            if state["consecutive_failures"] >= MAX_SSH_FAILURES:
+                state["consecutive_failures"] = 0
+                state["cooldown_cycles"] += 1
+                if state["cooldown_cycles"] > MAX_COOLDOWN_CYCLES:
+                    state["hard_locked"] = True
+                    state["locked_until"] = 0.0
+                    print(f"\n⛔ SSH has now failed across {MAX_COOLDOWN_CYCLES} "
+                          f"cooldown periods. Hard-locking SSH attempts to protect "
+                          f"this shared login node's IP.")
+                    print(f"   Fix your SSH authentication, then run:  argo-shim --reset\n")
+                else:
+                    state["locked_until"] = time.time() + COOLDOWN_SECONDS
+                    mins = COOLDOWN_SECONDS // 60
+                    print(f"\n⚠ SSH failed {MAX_SSH_FAILURES} times. Pausing all SSH "
+                          f"attempts for {mins} minutes to prevent an IP block.")
+                    print(f"  This pause SURVIVES restarting argo-shim. Fix your SSH "
+                          f"auth (see hint above) before trying again.\n")
             else:
-                remaining = MAX_SSH_FAILURES - self._consecutive_failures
-                print(f"  SSH failure {self._consecutive_failures}/{MAX_SSH_FAILURES} "
-                      f"({remaining} attempt(s) remaining before lockout)")
+                remaining = MAX_SSH_FAILURES - state["consecutive_failures"]
+                print(f"  SSH failure {state['consecutive_failures']}/{MAX_SSH_FAILURES} "
+                      f"({remaining} attempt(s) remaining before a cooldown)")
+            self._save(state)
+            return state
 
     def is_blocked(self):
+        """True if SSH attempts are currently refused (hard lock or active cooldown)."""
         with self._lock:
-            return self._blocked
+            state = self._load()
+            return self._blocked_locked(state)
+
+    def _blocked_locked(self, state):
+        if state.get("hard_locked"):
+            return True
+        return time.time() < state.get("locked_until", 0.0)
 
     def check_allowed(self):
-        """Raise SSHAuthError if further SSH attempts are blocked."""
-        if self.is_blocked():
-            raise SSHAuthError(
-                f"SSH retry limit reached ({MAX_SSH_FAILURES} consecutive failures). "
-                f"Fix SSH authentication and restart argo-shim."
-            )
+        """Raise SSHAuthError if SSH attempts are currently refused."""
+        with self._lock:
+            state = self._load()
+            if state.get("hard_locked"):
+                raise SSHAuthError(
+                    "SSH attempts are HARD-LOCKED after repeated authentication "
+                    "failures (to protect this shared login node from a CSPO IP "
+                    "block).\n  Fix your SSH auth, then run:  argo-shim --reset"
+                )
+            remaining = state.get("locked_until", 0.0) - time.time()
+            if remaining > 0:
+                mins = int(remaining // 60) + 1
+                raise SSHAuthError(
+                    f"SSH attempts are paused for ~{mins} more minute(s) after "
+                    f"repeated failures (this pause survives restarts).\n"
+                    f"  Fix your SSH authentication and wait for the cooldown, or "
+                    f"check status with:  argo-shim --status"
+                )
+
+    def reset(self):
+        """Clear all persisted lockout state (used by --reset)."""
+        with self._lock:
+            try:
+                if os.path.exists(STATE_PATH):
+                    os.remove(STATE_PATH)
+            except OSError:
+                self._save(dict(self._CLEAN))
+
+    def status_line(self):
+        """Return a one-line human summary of the current lockout state."""
+        state = self._load()
+        if state.get("hard_locked"):
+            return ("HARD-LOCKED after repeated SSH auth failures — run "
+                    "`argo-shim --reset` once your SSH auth works.")
+        remaining = state.get("locked_until", 0.0) - time.time()
+        if remaining > 0:
+            mins = int(remaining // 60) + 1
+            return (f"Cooling down: SSH paused for ~{mins} more minute(s) "
+                    f"(cycle {state.get('cooldown_cycles', 0)}/{MAX_COOLDOWN_CYCLES}).")
+        cf = state.get("consecutive_failures", 0)
+        if cf or state.get("cooldown_cycles"):
+            return (f"OK to try. Recent failures: {cf}/{MAX_SSH_FAILURES} "
+                    f"consecutive, {state.get('cooldown_cycles', 0)} cooldown cycle(s).")
+        return "OK — no recent SSH failures recorded."
 
 
 _ssh_tracker = SSHAttemptTracker()
@@ -600,6 +810,29 @@ def find_existing_tunnel(port, host="127.0.0.1"):
     return False
 
 
+def _spawn_ssh(cmd, what):
+    """Run a forking ssh command (`ssh -N -f ...`), capturing stderr.
+
+    Because `-f` backgrounds ssh after authentication, the captured stderr
+    contains the auth/connection diagnostics we need to classify failures. On
+    failure: print the captured stderr (so the user still sees it), classify the
+    error, record it against the persistent lockout (only auth-type kinds count),
+    and raise SSHAuthError with an actionable hint. Returns nothing on success.
+    """
+    result = subprocess.run(cmd, stderr=subprocess.PIPE, universal_newlines=True)
+    if result.returncode == 0:
+        return
+    stderr = (result.stderr or "").strip()
+    if stderr:
+        for line in stderr.splitlines():
+            print(f"    ssh: {line}")
+    kind, hint = _classify_ssh_error(stderr)
+    _ssh_tracker.record_failure(kind)
+    raise SSHAuthError(
+        f"{what} failed (exit code {result.returncode}, cause: {kind}).\n  {hint}"
+    )
+
+
 def create_tunnel(port, host="127.0.0.1", bind_address="127.0.0.1"):
     """Create a new SSH tunnel on the given port and verify it's working."""
     _ssh_tracker.check_allowed()
@@ -623,10 +856,7 @@ def create_tunnel(port, host="127.0.0.1", bind_address="127.0.0.1"):
     ])
     print(f"Creating SSH tunnel on port {port}...")
     print(f"  $ {' '.join(cmd)}")
-    result = subprocess.run(cmd)
-    if result.returncode != 0:
-        _ssh_tracker.record_failure()
-        raise SSHAuthError(f"SSH tunnel failed (exit code {result.returncode})")
+    _spawn_ssh(cmd, "SSH tunnel")
 
     # Wait for tunnel to start accepting connections
     for i in range(10):
@@ -674,10 +904,7 @@ def create_reverse_tunnel(remote_host, port):
            "-R", f"0.0.0.0:{port}:127.0.0.1:{port}", remote_host]
     print(f"Creating reverse tunnel to {remote_host}:{port}...")
     print(f"  $ {' '.join(cmd)}")
-    result = subprocess.run(cmd)
-    if result.returncode != 0:
-        _ssh_tracker.record_failure()
-        raise SSHAuthError(f"Reverse SSH tunnel to {remote_host} failed (exit code {result.returncode})")
+    _spawn_ssh(cmd, f"Reverse SSH tunnel to {remote_host}")
 
 
 def read_existing_token():
@@ -824,7 +1051,98 @@ def health_check(tunnel_host, tunnel_port, listen_port, auth_token):
     return ok
 
 
-def main():
+def _agent_has_identities():
+    """Return True if ssh-agent currently holds at least one identity.
+
+    Returns None if we can't tell (no agent running / ssh-add unavailable).
+    """
+    try:
+        result = subprocess.run(
+            ["ssh-add", "-l"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            universal_newlines=True, timeout=5,
+        )
+    except Exception:
+        return None
+    # ssh-add -l: rc 0 = has identities, rc 1 = agent running but empty,
+    # rc 2 = could not connect to agent.
+    if result.returncode == 0:
+        return True
+    if result.returncode == 1:
+        return False
+    return None
+
+
+def _local_key_files():
+    """Return a list of private SSH key files that exist in ~/.ssh."""
+    ssh_dir = os.path.expanduser("~/.ssh")
+    candidates = ["id_ed25519", "id_ecdsa", "id_rsa", "id_dsa"]
+    found = []
+    for name in candidates:
+        path = os.path.join(ssh_dir, name)
+        if os.path.isfile(path):
+            found.append(path)
+    return found
+
+
+def _print_first_time_setup_guide():
+    """Print the new-user SSH setup guide shown when no key material exists."""
+    print("\n" + "=" * 70)
+    print("  No SSH key found — argo-shim can't reach CELS yet.")
+    print("=" * 70)
+    print("  argo-shim connects to Argo over an SSH tunnel to CELS, which needs")
+    print("  an SSH key that CELS recognizes. It looks like you haven't set one")
+    print("  up yet. Do this ONCE, then re-run argo-shim:\n")
+    print("   1. Generate a key (press Enter at every prompt):")
+    print("        ssh-keygen -t ed25519\n")
+    print("   2. Copy your PUBLIC key:")
+    print("        cat ~/.ssh/id_ed25519.pub\n")
+    print(f"   3. Paste it into your CELS account at:")
+    print(f"        {ACCOUNTS_URL}")
+    print("      (SSH Keys section — paste the .pub contents, not the private key)\n")
+    print("   4. Load the key into your agent:")
+    print("        ssh-add\n")
+    print("   5. Verify it works (this should log you in WITHOUT a password):")
+    print(f"        ssh -o BatchMode=yes {SSH_PROXY_JUMP} true\n")
+    print("  Only once step 5 succeeds will argo-shim be able to connect.")
+    print("  We're stopping here on purpose: attempting SSH without a working")
+    print("  key just produces failed logins that can get this shared login")
+    print("  node's IP blocked for everyone.")
+    print("=" * 70 + "\n")
+
+
+def preflight_ssh_checks():
+    """Detect obvious SSH misconfiguration BEFORE attempting any connection.
+
+    Returns True if it's reasonable to proceed, False if argo-shim should stop
+    without ever spawning ssh (the new-user "no key at all" case). A False return
+    deliberately records NO failure — we never made a doomed attempt, so there's
+    nothing to count toward the lockout.
+    """
+    agent = _agent_has_identities()
+    key_files = _local_key_files()
+
+    # Case 1: no key material anywhere — the classic "never set up SSH" student.
+    if agent is not True and not key_files:
+        _print_first_time_setup_guide()
+        return False
+
+    # Case 2: keys exist on disk but the agent is empty (e.g. agent forwarding
+    # died when a laptop was closed). Non-fatal — ssh may still use the key file
+    # directly — but warn, since this is a common cause of auth failures.
+    if agent is False and key_files:
+        print("⚠ Your SSH agent has no loaded identities, though key files exist.")
+        print(f"  If the connection fails, run:  ssh-add")
+        print("  (Agent forwarding can drop when a laptop sleeps or disconnects.)")
+
+    # Always remind users how to verify auth independently of argo-shim.
+    smoke_host = SSH_PROXY_JUMP or SSH_JUMP_HOST
+    print(f"  Tip: confirm SSH works first with  "
+          f"ssh -o BatchMode=yes {smoke_host} true")
+    return True
+
+
+def _run():
     parser = argparse.ArgumentParser(description="HTTP proxy shim for Argo API via SSH tunnel")
     parser.add_argument("--no-auth", action="store_true",
                         help="Disable token authentication on the shim (useful when project-level "
@@ -862,9 +1180,29 @@ def main():
                         help="Make a direct connection to the host rather than jumping through SSH_PROXY_JUMP")
     parser.add_argument("-v", "--verbose", action="count", default=0,
                         help="Pass -v (or -vv, -vvv) through to every ssh command. Repeat for more verbosity.")
+    parser.add_argument("--reset", action="store_true",
+                        help="Clear the persistent SSH failure lockout state and exit. Use this after "
+                             "fixing your SSH authentication if argo-shim refuses to connect.")
+    parser.add_argument("--status", action="store_true",
+                        help="Print the current SSH failure/lockout status and exit (read-only).")
     args = parser.parse_args()
 
     global REAL_HOST, SSH_JUMP_HOST, SSH_PROXY_JUMP, SSH_VERBOSITY
+
+    # --status / --reset are read-only/maintenance actions: handle them first,
+    # before any other setup, and exit.
+    if args.status:
+        print(f"argo-shim SSH lockout status: {_ssh_tracker.status_line()}")
+        print(f"  (state file: {STATE_PATH})")
+        return
+    if args.reset:
+        print(f"Prior status: {_ssh_tracker.status_line()}")
+        _ssh_tracker.reset()
+        print("✓ SSH failure lockout cleared. Make sure your SSH auth works "
+              "before reconnecting:")
+        print(f"    ssh -o BatchMode=yes {SSH_PROXY_JUMP} true")
+        return
+
     SSH_VERBOSITY = min(args.verbose, 3)
     if SSH_VERBOSITY:
         print(f"SSH verbosity: -{'v' * SSH_VERBOSITY}")
@@ -891,6 +1229,13 @@ def main():
 
     print(f"API key: {API_KEY}")
 
+    # Detect obvious SSH misconfiguration before touching the network. --direct
+    # uses no SSH, so it's exempt. Modes that consume an existing remote tunnel
+    # may still need a local `ssh` forward, so they are NOT exempt.
+    if not args.direct:
+        if not preflight_ssh_checks():
+            return
+
     if args.port:
         listen_port = args.port
         port_is_auto = False
@@ -910,7 +1255,7 @@ def main():
             print(f"Tunnel already running on port {tunnel_port}")
         else:
             # Only auto-retry port increments when both ports are auto-derived
-            max_retries = 10 if (port_is_auto and tunnel_port_is_auto) else 1
+            max_retries = 3 if (port_is_auto and tunnel_port_is_auto) else 1
             for attempt in range(max_retries):
                 try:
                     create_tunnel(tunnel_port, bind_address="0.0.0.0")
@@ -944,10 +1289,7 @@ def main():
                            "-o", "BatchMode=yes", "-o", "ConnectionAttempts=1",
                            "-L", f"127.0.0.1:{tunnel_port}:127.0.0.1:{tunnel_port}", tunnel_host]
                 print(f"  $ {' '.join(fwd_cmd)}")
-                result = subprocess.run(fwd_cmd)
-                if result.returncode != 0:
-                    _ssh_tracker.record_failure()
-                    raise SSHAuthError(f"SSH forward to {tunnel_host} failed (exit code {result.returncode})")
+                _spawn_ssh(fwd_cmd, f"SSH forward to {tunnel_host}")
                 oc_tunnel_host = "127.0.0.1"
                 if not verify_tunnel(tunnel_port, oc_tunnel_host):
                     raise RuntimeError(
@@ -961,7 +1303,7 @@ def main():
             if find_existing_tunnel(tunnel_port):
                 print(f"Tunnel already running on port {tunnel_port}")
             else:
-                max_retries = 10 if (port_is_auto and tunnel_port_is_auto) else 1
+                max_retries = 3 if (port_is_auto and tunnel_port_is_auto) else 1
                 for attempt in range(max_retries):
                     try:
                         create_tunnel(tunnel_port)
@@ -987,7 +1329,7 @@ def main():
         if find_existing_tunnel(tunnel_port):
             print(f"Using existing tunnel on port {tunnel_port}")
         else:
-            max_retries = 10 if port_is_auto else 1
+            max_retries = 3 if port_is_auto else 1
             for attempt in range(max_retries):
                 try:
                     create_tunnel(tunnel_port)
@@ -1026,10 +1368,7 @@ def main():
                        "-o", "BatchMode=yes", "-o", "ConnectionAttempts=1",
                        "-L", f"127.0.0.1:{tunnel_port}:127.0.0.1:{tunnel_port}", tunnel_host]
             print(f"  $ {' '.join(fwd_cmd)}")
-            result = subprocess.run(fwd_cmd)
-            if result.returncode != 0:
-                _ssh_tracker.record_failure()
-                raise SSHAuthError(f"SSH forward to {tunnel_host} failed (exit code {result.returncode})")
+            _spawn_ssh(fwd_cmd, f"SSH forward to {tunnel_host}")
             tunnel_host = "127.0.0.1"
             if not verify_tunnel(tunnel_port, tunnel_host):
                 raise RuntimeError(
@@ -1043,7 +1382,7 @@ def main():
         print(f"Using existing tunnel on port {tunnel_port}")
     else:
         # Auto-retry port pair if derived (not explicit --port)
-        max_retries = 10 if port_is_auto else 1
+        max_retries = 3 if port_is_auto else 1
         for attempt in range(max_retries):
             try:
                 create_tunnel(tunnel_port)
@@ -1101,6 +1440,41 @@ def main():
 
         httpd.serve_forever()
         print("Shim stopped.")
+
+
+def _print_fatal(title, detail):
+    """Print a clean, boxed, traceback-free fatal error for end users."""
+    print("\n" + "=" * 70, file=sys.stderr)
+    print(f"  argo-shim: {title}", file=sys.stderr)
+    print("=" * 70, file=sys.stderr)
+    for line in str(detail).splitlines():
+        print(f"  {line}", file=sys.stderr)
+    print("=" * 70, file=sys.stderr)
+
+
+def main():
+    """Entry point: run the shim, turning expected failures into friendly,
+    traceback-free guidance instead of a Python stack dump."""
+    try:
+        _run()
+    except KeyboardInterrupt:
+        print("\nInterrupted.")
+        sys.exit(130)
+    except SSHAuthError as e:
+        _print_fatal("could not establish the SSH tunnel", e)
+        print(f"  Lockout status: {_ssh_tracker.status_line()}", file=sys.stderr)
+        print("  Please do NOT keep restarting — repeated failed SSH logins can",
+              file=sys.stderr)
+        print("  get this shared login node's IP blocked for everyone. Fix the",
+              file=sys.stderr)
+        print("  issue above first, then try again.", file=sys.stderr)
+        sys.exit(1)
+    except RuntimeError as e:
+        # Typically port exhaustion / verification failure — not an auth problem.
+        _print_fatal("startup failed", e)
+        print("  If this is a port conflict, pick another with: --port <PORT>",
+              file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

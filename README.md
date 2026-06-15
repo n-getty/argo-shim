@@ -20,6 +20,47 @@ argo-shim
 - Python 3.8+
 - Claude Code (`curl -fsSL https://claude.ai/install.sh | bash`)
 
+## First-time setup (new users start here)
+
+argo-shim reaches the Argo API over an **SSH tunnel to CELS**. That tunnel only
+works if CELS recognizes your SSH key. **Set this up once, and verify it works,
+before you run argo-shim.** Skipping this is the #1 cause of failures.
+
+1. **Generate an SSH key** (press Enter at every prompt to accept defaults):
+   ```bash
+   ssh-keygen -t ed25519
+   ```
+2. **Upload your _public_ key to your CELS account.** Print it and copy the
+   whole line:
+   ```bash
+   cat ~/.ssh/id_ed25519.pub
+   ```
+   Paste it into the SSH Keys section at **https://accounts.cels.anl.gov**.
+   Paste the `.pub` contents — never your private key.
+3. **Load the key into your SSH agent:**
+   ```bash
+   ssh-add
+   ```
+4. **Verify it works.** This must log you in **without a password prompt**:
+   ```bash
+   ssh -o BatchMode=yes logins.cels.anl.gov true
+   ```
+   If that command succeeds (no output, no password prompt, exit 0), you're
+   ready. If it fails, fix it here — argo-shim cannot work until this does.
+
+> argo-shim runs this same check for you on startup and **refuses to start** if
+> it finds no SSH key at all, pointing you back to these steps. That's on
+> purpose — see the warning below.
+
+> ⚠️ **If argo-shim fails, do _not_ keep restarting it.**
+> ALCF login nodes are shared, and CELS/CSPO security blocks the **whole node's
+> IP** after too many failed SSH logins — which would break Argo access for
+> *everyone* on that node (and is why this is getting locked down). A failed
+> connection almost always means a setup problem that a restart won't fix.
+> Read the error message, fix the one thing it names, then try again. argo-shim
+> now enforces a cooldown after repeated failures so an accidental restart loop
+> can't get the node blocked (see [SSH Auth Failure Protection](#ssh-auth-failure-protection)).
+
 ## Quick Start
 
 **1. Run the shim**
@@ -130,25 +171,71 @@ curl -H "x-api-key: <auth-token>" http://127.0.0.1:<shim-port>/v1/models
 
 ALCF and CELS networks are monitored by CSPO (Cyber Security). Too many failed SSH authentication attempts from a single IP will cause CSPO to block that IP — and since multiple users share ALCF login nodes, one user's broken auth can block the entire node for everyone.
 
-The shim protects against this with an **SSH attempt tracker** that counts consecutive SSH failures. After **3 consecutive failures**, all further SSH attempts are disabled and the shim returns `503` errors to clients with a message to fix auth and restart.
+argo-shim protects against this in three layers:
+
+**1. Preflight checks (before any SSH attempt).**
+On startup, argo-shim looks for usable SSH key material. If you have **no key at
+all**, it prints the [first-time setup](#first-time-setup-new-users-start-here)
+steps and **refuses to start** — it will not make a doomed connection that
+counts against the node's IP. If you have a key on disk but nothing loaded in
+your agent, it warns you to run `ssh-add` (a common symptom of a laptop that
+slept and dropped agent forwarding).
+
+**2. Failure classification.**
+When an SSH command does fail, argo-shim reads ssh's own error output and
+classifies it: an **auth** failure (`Permission denied (publickey)`, etc.) is
+the dangerous, IP-block-triggering kind and is counted; a transient **network**
+error or a busy **local port** is *not* counted, because it isn't a failed
+login. Each failure prints a specific, actionable hint.
+
+**3. A persistent lockout that survives restarts.**
+This is the key change. The failure counter is stored on disk
+(`~/.claude/argo-shim-state.json`), so quitting and re-running argo-shim **does
+not** reset it — you can no longer accidentally hammer CELS with a restart loop.
+
+- After **2 consecutive auth failures**, all SSH attempts pause for a **15-minute
+  cooldown**. The cooldown clears itself.
+- If failures continue across multiple cooldowns, argo-shim escalates to a
+  **hard lock** that only `argo-shim --reset` clears (after you've fixed auth).
+
+Check or clear the state at any time:
+
+```bash
+argo-shim --status   # show current lockout/cooldown state (read-only)
+argo-shim --reset    # clear the lockout after you've fixed your SSH auth
+```
 
 Common causes of repeated SSH auth failures:
+- SSH **public** key not uploaded to https://accounts.cels.anl.gov
 - Closing your laptop while SSH agent forwarding is active (kills the forwarded key)
+- SSH key removed from the agent (`ssh-add -D`) — fix with `ssh-add`
 - Expired Kerberos tickets
-- SSH key removed from the agent (`ssh-add -D`)
 
-When the tracker trips, you'll see:
-
-```
-⚠ SSH has failed 3 consecutive times. Disabling further SSH attempts to prevent IP blocks.
-  Fix your SSH authentication (ssh-add, reconnect agent forwarding, etc.) and restart argo-shim.
-```
-
-To recover: fix your SSH auth (e.g., `ssh-add`, reconnect your laptop, renew tickets), then restart argo-shim. The tracker resets on restart.
+To recover from a cooldown or hard lock: **first** make this succeed —
+`ssh -o BatchMode=yes logins.cels.anl.gov true` — then run `argo-shim --reset`
+(if hard-locked) and start argo-shim again.
 
 All SSH commands also use `BatchMode=yes` (no interactive password fallback) and `ConnectionAttempts=1` to ensure each attempt is a single, non-interactive connection.
 
 ## Troubleshooting
+
+> **Before anything else:** confirm SSH itself works, independent of argo-shim:
+> ```bash
+> ssh -o BatchMode=yes logins.cels.anl.gov true
+> ```
+> If that fails, argo-shim cannot work — fix SSH first (see the table below).
+> **Do not loop on restarting argo-shim** while SSH is broken.
+
+| Symptom | Likely cause | Fix (do this one thing) |
+| --- | --- | --- |
+| `Permission denied (publickey)` | Public key not on your CELS account, or wrong key in use | Upload `~/.ssh/id_ed25519.pub` at https://accounts.cels.anl.gov, then `ssh-add` |
+| argo-shim prints "No SSH key found" and exits | You haven't set up an SSH key yet | Follow [First-time setup](#first-time-setup-new-users-start-here) |
+| Worked earlier, now `Permission denied` after closing your laptop | Agent forwarding dropped when the laptop slept | Reconnect, then `ssh-add` |
+| "SSH attempts are paused for ~N minutes" | You hit the failure cooldown | Fix your SSH auth and wait out the cooldown; check with `argo-shim --status` |
+| "SSH attempts are HARD-LOCKED" | Repeated failures across cooldowns | Fix SSH auth, then `argo-shim --reset` |
+| `Host key verification failed` / host identity changed | Stale entry in `~/.ssh/known_hosts` | Remove the stale line **only if you trust the change**, then retry once |
+| `Could not resolve hostname` / `Connection timed out` | Network/VPN problem, not auth | Check your connection/VPN (this is *not* counted against the lockout) |
+| `Port already in use` | Another process holds the derived port | `argo-shim --port <PORT>` |
 
 **`[SSL: WRONG_VERSION_NUMBER]` proxy errors**
 
