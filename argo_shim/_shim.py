@@ -866,13 +866,31 @@ def probe_shim(listen_port, auth_token, host="127.0.0.1"):
     return "healthy"
 
 
+def _pid_alive(pid):
+    """True if `pid` is still a live process (signal 0 probe)."""
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists but not ours to signal — treat as alive
+    except OSError:
+        return False
+
+
 def stop_own_shim(listen_port, host="127.0.0.1"):
     """Stop this user's shim listening on listen_port (for --restart).
 
-    SIGTERMs only a listener we own (never another user's process) and polls until
-    the port frees. The SSH tunnel is intentionally left alive so the subsequent
-    startup reuses it Duo-free. Returns True if the port was freed (or was already
-    free), False if a process we own could not be stopped.
+    SIGTERMs only a listener we own (never another user's process), waits for the
+    process to actually exit, and escalates to SIGKILL if it lingers. We confirm
+    by watching the PID itself rather than re-binding the port — the server sets
+    allow_reuse_address, so a bind probe can race with socket teardown and give a
+    misleading result (the cause of the "still held" flake on fast restarts).
+
+    The SSH tunnel is intentionally left alive so the subsequent startup reuses it
+    Duo-free. Returns True once our shim is gone (or there was nothing to stop),
+    False only if a process we own refused to die.
     """
     pid = find_own_listener_pid(listen_port)
     if pid is None:
@@ -880,11 +898,39 @@ def stop_own_shim(listen_port, host="127.0.0.1"):
     print(f"  Stopping existing argo-shim (PID {pid}) on port {listen_port}...")
     try:
         os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return True  # already gone
     except OSError as e:
         print(f"  ✗ Could not stop PID {pid}: {e}")
         return False
+
+    # Wait up to ~10s for a graceful exit (the shim shuts down its server in a
+    # background thread, which can take a moment under load / fresh interpreter).
+    for _ in range(20):
+        if not _pid_alive(pid):
+            break
+        time.sleep(0.5)
+    else:
+        # Still alive after SIGTERM — escalate.
+        print(f"  PID {pid} didn't exit on SIGTERM; sending SIGKILL...")
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        for _ in range(10):
+            if not _pid_alive(pid):
+                break
+            time.sleep(0.5)
+        else:
+            print(f"  ✗ PID {pid} still alive after SIGKILL")
+            return False
+
+    # Process is gone. Give the OS a moment to release the listening socket, then
+    # confirm the port is actually free (bind with SO_REUSEADDR to match the
+    # server's allow_reuse_address so we don't false-fail on teardown state).
     for _ in range(10):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
                 s.bind((host, listen_port))
                 print(f"  ✓ Stopped; port {listen_port} is free")
@@ -1436,7 +1482,12 @@ def _run():
     if shim_status in ("healthy", "dead_tunnel"):
         if args.restart:
             print(f"--restart: stopping the existing shim on port {listen_port}...")
-            stop_own_shim(listen_port)
+            if not stop_own_shim(listen_port):
+                print(f"\n⚠ Could not free port {listen_port}. The old shim may still")
+                print(f"  be shutting down — wait a moment and try --restart again, or")
+                print(f"  stop it manually:  lsof -tiTCP:{listen_port} -sTCP:LISTEN | xargs kill")
+                print(f"  No SSH connection was attempted.")
+                return 1
             # Fall through to normal startup. A still-healthy tunnel is reused
             # Duo-free by find_existing_tunnel below; only a dead one rebuilds.
         elif shim_status == "healthy":
@@ -1479,7 +1530,11 @@ def _run():
             # that might just be slow to respond.
             if args.restart:
                 print(f"--restart: stopping an unresponsive argo-shim on port {listen_port}...")
-                stop_own_shim(listen_port)
+                if not stop_own_shim(listen_port):
+                    print(f"\n⚠ Could not free port {listen_port}; stop it manually:")
+                    print(f"    lsof -tiTCP:{listen_port} -sTCP:LISTEN | xargs kill")
+                    print(f"  No SSH connection was attempted.")
+                    return 1
             else:
                 print(f"\n⚠ An argo-shim of yours holds port {listen_port} but isn't responding.")
                 print(f"  Restart it cleanly with:  argo-shim --restart")
