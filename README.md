@@ -91,6 +91,38 @@ The tunnel will use the port immediately below (e.g., `--port 8083` → tunnel o
 claude
 ```
 
+## Already running? Restarting safely
+
+**Rerunning `argo-shim` is safe.** If a healthy shim of yours is already running,
+a plain `argo-shim` detects it, re-syncs `~/.claude/settings.json`, and exits
+without touching SSH — so an accidental second launch never triggers another Duo
+login. (This matters on shared login nodes: repeated SSH auths are what get a
+node's IP blocked.)
+
+| You run `argo-shim` and… | What happens |
+| --- | --- |
+| a healthy shim is already running | "already running — nothing to do", settings re-synced, exits. No SSH. |
+| a shim is running but its tunnel died | Tells you it will self-recover on the next request; suggests `--restart`. No SSH, nothing killed. |
+| the port is held by **another user** | Friendly message to pick `--port <PORT>`. **No SSH attempted.** |
+| nothing is running | Normal startup (reuses a live tunnel if present, else creates one). |
+
+To force a clean restart of your own shim:
+
+```bash
+argo-shim --restart
+```
+
+`--restart` stops your existing shim and starts fresh. It **reuses a still-healthy
+SSH tunnel** (no new Duo prompt) and only rebuilds the tunnel if it's actually
+dead.
+
+To check or clear SSH-failure state:
+
+```bash
+argo-shim --status   # show lockout/cooldown state (read-only)
+argo-shim --reset    # clear the lockout after fixing your SSH auth
+```
+
 ## Running from Compute Nodes
 
 Compute nodes don't have outbound network access, so they can't create SSH tunnels directly. Instead, create the tunnel on a UAN and point the shim at it.
@@ -235,7 +267,9 @@ All SSH commands also use `BatchMode=yes` (no interactive password fallback) and
 | "SSH attempts are HARD-LOCKED" | Repeated failures across cooldowns | Fix SSH auth, then `argo-shim --reset` |
 | `Host key verification failed` / host identity changed | Stale entry in `~/.ssh/known_hosts` | Remove the stale line **only if you trust the change**, then retry once |
 | `Could not resolve hostname` / `Connection timed out` | Network/VPN problem, not auth | Check your connection/VPN (this is *not* counted against the lockout) |
-| `Port already in use` | Another process holds the derived port | `argo-shim --port <PORT>` |
+| "already running and healthy — nothing to do" | You already have a shim running | Nothing needed; use `argo-shim --restart` only if you want a fresh start |
+| "already running … but its SSH tunnel is down" | Shim is up, tunnel dropped | Let it self-recover on the next request, or `argo-shim --restart` to rebuild now |
+| "Port … is held by another process / NOT your argo-shim" | Another user holds your derived port | `argo-shim --port <PORT>` (no SSH was attempted) |
 
 **`[SSL: WRONG_VERSION_NUMBER]` proxy errors**
 

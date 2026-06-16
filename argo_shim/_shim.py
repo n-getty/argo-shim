@@ -811,6 +811,90 @@ def find_existing_tunnel(port, host="127.0.0.1"):
     return False
 
 
+def find_own_listener_pid(port):
+    """Return the PID of a listener on `port` owned by the current user, else None.
+
+    Same lsof + `ps -o user=` ownership pattern as is_own_process() and
+    _kill_stale_tunnel(); used to tell "my own shim" apart from another user's
+    process holding the port.
+    """
+    try:
+        result = subprocess.run(
+            ["lsof", "-ti", f"TCP:{port}", "-sTCP:LISTEN"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=5
+        )
+        for pid in result.stdout.strip().split('\n'):
+            if not pid:
+                continue
+            stat = subprocess.run(
+                ["ps", "-o", "user=", "-p", pid],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=5
+            )
+            if stat.stdout.strip() == API_KEY:
+                return int(pid)
+            return None
+    except Exception:
+        pass
+    return None
+
+
+def probe_shim(listen_port, auth_token, host="127.0.0.1"):
+    """Probe a possibly-running shim end-to-end. Returns one of:
+
+      "healthy"      - shim answered and the upstream chain is up (HTTP < 500)
+      "dead_tunnel"  - shim is up but its tunnel/upstream is down (502/503)
+      "down"         - nothing is listening / no shim there
+
+    This is the same end-to-end request the shim-half of health_check() makes, so
+    it is mode-agnostic (default / --direct / --tunnel-host / --relay all proxy
+    /v1/models the same way). It lets us detect an already-running instance
+    BEFORE attempting any SSH.
+    """
+    try:
+        conn = http.client.HTTPConnection(host, listen_port, timeout=5)
+        headers = {"x-api-key": auth_token} if auth_token else {}
+        conn.request("GET", "/v1/models", headers=headers)
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+    except (ConnectionRefusedError, OSError):
+        return "down"
+    except Exception:
+        return "down"
+    if resp.status in (502, 503):
+        return "dead_tunnel"
+    return "healthy"
+
+
+def stop_own_shim(listen_port, host="127.0.0.1"):
+    """Stop this user's shim listening on listen_port (for --restart).
+
+    SIGTERMs only a listener we own (never another user's process) and polls until
+    the port frees. The SSH tunnel is intentionally left alive so the subsequent
+    startup reuses it Duo-free. Returns True if the port was freed (or was already
+    free), False if a process we own could not be stopped.
+    """
+    pid = find_own_listener_pid(listen_port)
+    if pid is None:
+        return True  # nothing of ours to stop
+    print(f"  Stopping existing argo-shim (PID {pid}) on port {listen_port}...")
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError as e:
+        print(f"  ✗ Could not stop PID {pid}: {e}")
+        return False
+    for _ in range(10):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind((host, listen_port))
+                print(f"  ✓ Stopped; port {listen_port} is free")
+                return True
+            except OSError:
+                time.sleep(0.5)
+    print(f"  ✗ Port {listen_port} still held after stopping PID {pid}")
+    return False
+
+
 def _spawn_ssh(cmd, what):
     """Run a forking ssh command (`ssh -N -f ...`), capturing stderr to a file.
 
@@ -1200,6 +1284,9 @@ def _run():
                              "fixing your SSH authentication if argo-shim refuses to connect.")
     parser.add_argument("--status", action="store_true",
                         help="Print the current SSH failure/lockout status and exit (read-only).")
+    parser.add_argument("--restart", action="store_true",
+                        help="Stop an existing argo-shim of yours (if any) and start fresh. Reuses a "
+                             "healthy SSH tunnel without re-prompting Duo; rebuilds only if it's dead.")
     args = parser.parse_args()
 
     global REAL_HOST, SSH_JUMP_HOST, SSH_PROXY_JUMP, SSH_VERBOSITY
@@ -1339,6 +1426,66 @@ def _run():
         print(f"  NODE_TLS_REJECT_UNAUTHORIZED=0 opencode")
         return
 
+    # Single-instance detection — runs BEFORE any SSH/tunnel work for all
+    # shim-starting modes (the early-return --tunnel/--opencode modes already
+    # returned above). This is the main ban-safety guard: a forgotten rerun, or a
+    # rerun after a tunnel broke, must NOT trigger a fresh SSH auth on a shared
+    # login node. Ports are deterministic from the username, so a rerun targets
+    # the same listen_port and we can recognize our own shim.
+    shim_status = probe_shim(listen_port, read_existing_token())
+    if shim_status in ("healthy", "dead_tunnel"):
+        if args.restart:
+            print(f"--restart: stopping the existing shim on port {listen_port}...")
+            stop_own_shim(listen_port)
+            # Fall through to normal startup. A still-healthy tunnel is reused
+            # Duo-free by find_existing_tunnel below; only a dead one rebuilds.
+        elif shim_status == "healthy":
+            print(f"✓ argo-shim is already running and healthy on port {listen_port}. Nothing to do.")
+            if not args.no_update_settings:
+                # Re-sync settings.json in case the port/token drifted, so Claude
+                # Code still points at the live shim.
+                update_claude_settings(listen_port, read_existing_token())
+            print(f"  To force a fresh start: argo-shim --restart")
+            print(f"  To stop it: kill the argo-shim process (or close its terminal).")
+            return
+        else:  # dead_tunnel
+            print(f"argo-shim is already running on port {listen_port}, but its SSH tunnel is down.")
+            print(f"  It will try to recover automatically on the next request.")
+            print(f"  To rebuild the tunnel now:  argo-shim --restart")
+            return
+    elif shim_status == "down":
+        # Port may still be physically occupied by something that ISN'T a shim of
+        # ours (another user, or an unrelated process). Detect that here and fail
+        # cleanly WITHOUT attempting SSH, instead of creating a tunnel and only
+        # then discovering the listen port is taken.
+        port_busy = False
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(("127.0.0.1", listen_port))
+            except OSError:
+                port_busy = True
+        if port_busy:
+            own_pid = find_own_listener_pid(listen_port)
+            if own_pid is None:
+                info = _port_in_use_info(listen_port)
+                detail = f" (in use by: {info})" if info else ""
+                print(f"\n⚠ Port {listen_port} is held by another process{detail}.")
+                print(f"  This is NOT your argo-shim. Pick a different port:")
+                print(f"    argo-shim --port <PORT>")
+                print(f"  No SSH connection was attempted.")
+                return 1
+            # Port is ours but the shim isn't answering (hung / wedged). Only
+            # --restart should clear it; a plain rerun must not kill a process
+            # that might just be slow to respond.
+            if args.restart:
+                print(f"--restart: stopping an unresponsive argo-shim on port {listen_port}...")
+                stop_own_shim(listen_port)
+            else:
+                print(f"\n⚠ An argo-shim of yours holds port {listen_port} but isn't responding.")
+                print(f"  Restart it cleanly with:  argo-shim --restart")
+                print(f"  No SSH connection was attempted.")
+                return 1
+
     if args.relay:
         # Relay mode: create local tunnel, then reverse-forward to remote host
         if find_existing_tunnel(tunnel_port):
@@ -1471,7 +1618,9 @@ def main():
     """Entry point: run the shim, turning expected failures into friendly,
     traceback-free guidance instead of a Python stack dump."""
     try:
-        _run()
+        rc = _run()
+        if rc:
+            sys.exit(rc)
     except KeyboardInterrupt:
         print("\nInterrupted.")
         sys.exit(130)
