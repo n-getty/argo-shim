@@ -12,6 +12,7 @@ import socketserver
 import ssl
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -811,18 +812,32 @@ def find_existing_tunnel(port, host="127.0.0.1"):
 
 
 def _spawn_ssh(cmd, what):
-    """Run a forking ssh command (`ssh -N -f ...`), capturing stderr.
+    """Run a forking ssh command (`ssh -N -f ...`), capturing stderr to a file.
 
-    Because `-f` backgrounds ssh after authentication, the captured stderr
-    contains the auth/connection diagnostics we need to classify failures. On
-    failure: print the captured stderr (so the user still sees it), classify the
-    error, record it against the persistent lockout (only auth-type kinds count),
-    and raise SSHAuthError with an actionable hint. Returns nothing on success.
+    `ssh -f` authenticates in the foreground (including the interactive Duo
+    prompt, which ssh writes to /dev/tty) and then forks a long-lived background
+    tunnel before the parent exits. That backgrounded child inherits its parent's
+    file descriptors and keeps them open for the whole session.
+
+    This is why we must NOT use stderr=subprocess.PIPE here: subprocess.run would
+    read the pipe until EOF, but the surviving tunnel child holds the pipe's
+    write-end open indefinitely, so EOF never arrives and the call hangs right
+    after a *successful* Duo auth. Capturing to a regular file avoids the pipe
+    dependency — subprocess.run waits only on the parent ssh, and any auth/
+    connection diagnostics (written by the parent before it forks) are still on
+    disk for us to classify.
+
+    On failure: print the captured stderr (so the user still sees it), classify
+    the error, record it against the persistent lockout (only auth-type kinds
+    count), and raise SSHAuthError with an actionable hint. Returns nothing on
+    success.
     """
-    result = subprocess.run(cmd, stderr=subprocess.PIPE, universal_newlines=True)
+    with tempfile.TemporaryFile(mode="w+") as errfile:
+        result = subprocess.run(cmd, stderr=errfile)
+        errfile.seek(0)
+        stderr = errfile.read().strip()
     if result.returncode == 0:
         return
-    stderr = (result.stderr or "").strip()
     if stderr:
         for line in stderr.splitlines():
             print(f"    ssh: {line}")
