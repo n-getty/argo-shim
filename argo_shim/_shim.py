@@ -664,19 +664,34 @@ def _port_in_use_info(port):
     return None
 
 
-def check_port_available(port, host="127.0.0.1"):
-    """Check that a port is available, or raise with a helpful message."""
+def _port_bindable(port, host="127.0.0.1"):
+    """True if we could bind `port` as the shim server will.
+
+    Crucially this sets SO_REUSEADDR to match ThreadedTCPServer.allow_reuse_address
+    — otherwise a port left in TIME_WAIT (e.g. right after --restart kills the old
+    shim) looks "in use" to a plain bind() even though the real server would bind
+    it fine. That mismatch caused --restart to false-fail with "Port already in
+    use" / "held by another process".
+    """
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             s.bind((host, port))
+            return True
         except OSError:
-            info = _port_in_use_info(port)
-            detail = f"\n  In use by: {info}" if info else \
-                     f"\n  Try: lsof -iTCP:{port} -sTCP:LISTEN"
-            raise RuntimeError(
-                f"Port {port} on {host} is already in use.{detail}\n"
-                f"  Use --port <PORT> to specify a different port."
-            )
+            return False
+
+
+def check_port_available(port, host="127.0.0.1"):
+    """Check that a port is available, or raise with a helpful message."""
+    if not _port_bindable(port, host):
+        info = _port_in_use_info(port)
+        detail = f"\n  In use by: {info}" if info else \
+                 f"\n  Try: lsof -iTCP:{port} -sTCP:LISTEN"
+        raise RuntimeError(
+            f"Port {port} on {host} is already in use.{detail}\n"
+            f"  Use --port <PORT> to specify a different port."
+        )
 
 
 def _kill_stale_tunnel(port, bind_address="127.0.0.1"):
@@ -1508,14 +1523,10 @@ def _run():
         # Port may still be physically occupied by something that ISN'T a shim of
         # ours (another user, or an unrelated process). Detect that here and fail
         # cleanly WITHOUT attempting SSH, instead of creating a tunnel and only
-        # then discovering the listen port is taken.
-        port_busy = False
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            try:
-                s.bind(("127.0.0.1", listen_port))
-            except OSError:
-                port_busy = True
-        if port_busy:
+        # then discovering the listen port is taken. Use _port_bindable (with
+        # SO_REUSEADDR, as the server binds) so a TIME_WAIT port isn't mistaken
+        # for a foreign listener.
+        if not _port_bindable(listen_port):
             own_pid = find_own_listener_pid(listen_port)
             if own_pid is None:
                 info = _port_in_use_info(listen_port)
