@@ -1331,6 +1331,8 @@ def _run():
                              "Use on CELS machines that have direct network access to apps.inside.anl.gov.")
     parser.add_argument("--test", action="store_true",
                         help="Use the Argo test environment (apps-test.inside.anl.gov) instead of production.")
+    parser.add_argument("--dev", action="store_true",
+                        help="Use the Argo dev environment (apps-dev.inside.anl.gov) instead of production.")
     parser.add_argument("--opencode", action="store_true",
                         help="Configure opencode to use the SSH tunnel (updates opencode.json) and exit. "
                              "Does not start the shim.")
@@ -1373,6 +1375,10 @@ def _run():
     if args.test:
         REAL_HOST = "apps-test.inside.anl.gov"
         print(f"Using test environment: {REAL_HOST}")
+
+    if args.dev:
+        REAL_HOST = "apps-dev.inside.anl.gov"
+        print(f"Using dev environment: {REAL_HOST}")
 
     if args.host:
         SSH_JUMP_HOST = args.host
