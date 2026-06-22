@@ -33,6 +33,14 @@ SSH_JUMP_HOST = "homes.cels.anl.gov"
 SSH_PROXY_JUMP = "logins.cels.anl.gov"
 SSH_VERBOSITY = 0
 
+# Idle keep-alive connections are closed after this many seconds with no request,
+# so their daemon threads exit instead of leaking until the per-user thread limit
+# is hit. This is a per-operation socket timeout, so it also bounds reads/writes
+# during an active stream — set it ABOVE the upstream HTTPSConnection timeout (300s)
+# so a genuinely slow SSE stream hits the upstream timeout (a clean error) first,
+# and this only ever reaps connections that are truly idle between requests.
+CONNECTION_IDLE_TIMEOUT = 305
+
 # Failure/lockout policy. Retries to CELS rarely change the outcome (a broken
 # key stays broken) but each failed auth pushes the shared login-node IP closer
 # to a CSPO block, so we keep these deliberately small.
@@ -305,6 +313,18 @@ _ssh_tracker = SSHAttemptTracker()
 
 class ProxyHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
+
+    # Reap idle keep-alive connections. With HTTP/1.1, Claude Code's connection
+    # pool holds connections open speculatively, and each one pins a daemon
+    # thread blocked in rfile.readline() waiting for the next request. Without a
+    # timeout those threads never exit, so they accumulate over a session and
+    # eventually hit the per-user thread/process limit (low on ALCF login nodes),
+    # crashing with "RuntimeError: can't start new thread". A socket timeout makes
+    # BaseHTTPRequestHandler.handle_one_request set close_connection and return,
+    # letting the thread exit. It is a per-operation socket timeout, so it also
+    # caps reads/writes during a stream — kept above the upstream 300s timeout so
+    # a slow stream errors upstream first and this only reaps truly idle sockets.
+    timeout = CONNECTION_IDLE_TIMEOUT
 
     def do_GET(self):
         self.handle_proxy("GET")
@@ -612,6 +632,22 @@ class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
         if sys.exc_info()[0] is ConnectionResetError:
             return
         super().handle_error(request, client_address)
+
+    def process_request(self, request, client_address):
+        # ThreadingMixIn spawns a daemon thread per request. On ALCF login nodes
+        # the per-user thread/process limit is low, and if we ever hit it,
+        # t.start() raises RuntimeError("can't start new thread") in socketserver
+        # — which dumps a traceback and drops the request. Fall back to handling
+        # the request inline (synchronously) so it still completes; the idle-
+        # connection timeout means the backlog drains rather than growing.
+        try:
+            super().process_request(request, client_address)
+        except RuntimeError as e:
+            if "can't start new thread" not in str(e):
+                raise
+            print("⚠ Thread limit reached — handling request inline. "
+                  "Raise your shell's process limit (ulimit -u) for more concurrency.")
+            self.process_request_thread(request, client_address)
 
     def __init__(self, server_address, handler, target_host, target_port, auth_token, tunnel_is_remote=False):
         self.target_host = target_host
@@ -1649,6 +1685,8 @@ def _run():
         update_claude_settings(listen_port, auth_token)
         print(f"Set ANTHROPIC_BASE_URL=http://127.0.0.1:{listen_port}/argoapi")
 
+    _raise_thread_limit()
+
     tunnel_is_remote = bool(args.tunnel_host) or args.direct
     with ThreadedTCPServer(("127.0.0.1", listen_port), ProxyHandler, tunnel_host, tunnel_port, auth_token, tunnel_is_remote) as httpd:
         if args.direct:
@@ -1674,6 +1712,24 @@ def _run():
 
         httpd.serve_forever()
         print("Shim stopped.")
+
+
+def _raise_thread_limit():
+    """Best-effort raise of the soft process/thread limit to the hard limit.
+
+    ThreadingMixIn spawns one thread per connection. ALCF login nodes cap
+    per-user processes (RLIMIT_NPROC) low; raising the soft limit toward the
+    hard limit gives long sessions more headroom before falling back to inline
+    handling. Silently does nothing if the platform lacks `resource` or the
+    bump is not permitted."""
+    try:
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NPROC)
+        if hard != resource.RLIM_INFINITY and (soft == resource.RLIM_INFINITY or soft >= hard):
+            return
+        resource.setrlimit(resource.RLIMIT_NPROC, (hard, hard))
+    except (ImportError, ValueError, OSError):
+        pass
 
 
 def _print_fatal(title, detail):
