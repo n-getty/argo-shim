@@ -460,7 +460,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             if method != "HEAD" and client_key != self.server.auth_token:
                 self.send_response(401)
                 self.send_header('Content-Type', 'text/plain')
-                msg = b'Unauthorized: invalid or missing x-api-key'
+                msg = b'Unauthorized: invalid or missing x-api-key (or Authorization: Bearer token)'
                 self.send_header('Content-Length', str(len(msg)))
                 self.end_headers()
                 self.wfile.write(msg)
@@ -522,12 +522,19 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         if method == "POST" and body and "/chat/completions" in self.path:
             try:
                 req_json = json.loads(body)
-                if not req_json.get("user"):
-                    req_json["user"] = ARGO_USER
-                    body = json.dumps(req_json).encode("utf-8")
-                    print(f"[{method}] /chat/completions: injected user={ARGO_USER} (model={req_json.get('model', '<not set>')})")
+                # Only mutate object bodies; valid non-object JSON (e.g. an array)
+                # is forwarded untouched rather than crashing the handler.
+                if not isinstance(req_json, dict):
+                    print(f"[{method}] /chat/completions: body is not a JSON object, forwarding as-is")
                 else:
-                    print(f"[{method}] /chat/completions: user already set ({req_json.get('user')})")
+                    existing = req_json.get("user")
+                    # Treat blank/whitespace user as missing — Argo rejects it.
+                    if not (isinstance(existing, str) and existing.strip()):
+                        req_json["user"] = ARGO_USER
+                        body = json.dumps(req_json).encode("utf-8")
+                        print(f"[{method}] /chat/completions: injected user={ARGO_USER} (model={req_json.get('model', '<not set>')})")
+                    else:
+                        print(f"[{method}] /chat/completions: user already set ({existing})")
             except (json.JSONDecodeError, UnicodeDecodeError):
                 print(f"[{method}] /chat/completions: could not parse body, forwarding as-is")
 
