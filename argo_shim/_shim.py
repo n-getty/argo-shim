@@ -19,6 +19,13 @@ import time
 TARGET_HOST = "127.0.0.1"
 REAL_HOST = "apps.inside.anl.gov"
 API_KEY = os.environ.get("CELS_USERNAME", getpass.getuser())
+
+# Argo's OpenAI-compatible /chat/completions endpoint (used for OpenAI and
+# Gemini models) requires a `user` field set to a valid ALCF username, or it
+# returns HTTP 500. The Anthropic /messages path does NOT need this. We
+# auto-inject it so OpenAI-format clients work without having to know about it.
+# Resolution mirrors API_KEY: $ARGO_USER, else $CELS_USERNAME, else login user.
+ARGO_USER = os.environ.get("ARGO_USER") or os.environ.get("CELS_USERNAME") or getpass.getuser()
 OPENCODE_CONFIG = os.path.expanduser("~/.config/opencode/opencode.json")
 STATE_PATH = os.path.expanduser("~/.claude/argo-shim-state.json")
 ACCOUNTS_URL = "https://accounts.cels.anl.gov"
@@ -443,10 +450,17 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         # Validate auth token (HEAD is exempt — used by Claude Code as a connectivity probe)
         if self.server.auth_token:
             client_key = self.headers.get('x-api-key', '')
+            # Also accept `Authorization: Bearer <token>`, so OpenAI-format clients
+            # (which authenticate with a bearer token rather than x-api-key) can
+            # reach the shim too.
+            if not client_key:
+                auth_hdr = self.headers.get('Authorization', '')
+                if auth_hdr.lower().startswith('bearer '):
+                    client_key = auth_hdr[7:].strip()
             if method != "HEAD" and client_key != self.server.auth_token:
                 self.send_response(401)
                 self.send_header('Content-Type', 'text/plain')
-                msg = b'Unauthorized: invalid or missing x-api-key'
+                msg = b'Unauthorized: invalid or missing x-api-key (or Authorization: Bearer token)'
                 self.send_header('Content-Length', str(len(msg)))
                 self.end_headers()
                 self.wfile.write(msg)
@@ -501,6 +515,28 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                         body = json.dumps(req_json).encode("utf-8")
             except (json.JSONDecodeError, UnicodeDecodeError):
                 print(f"[{method}] /messages: could not parse body, forwarding as-is")
+
+        # Inject `user` on OpenAI/Gemini chat-completions requests. Argo returns
+        # HTTP 500 if the `user` field is missing or not a valid ALCF username.
+        # Only applies to /chat/completions (not /messages, which Claude uses).
+        if method == "POST" and body and "/chat/completions" in self.path:
+            try:
+                req_json = json.loads(body)
+                # Only mutate object bodies; valid non-object JSON (e.g. an array)
+                # is forwarded untouched rather than crashing the handler.
+                if not isinstance(req_json, dict):
+                    print(f"[{method}] /chat/completions: body is not a JSON object, forwarding as-is")
+                else:
+                    existing = req_json.get("user")
+                    # Treat blank/whitespace user as missing — Argo rejects it.
+                    if not (isinstance(existing, str) and existing.strip()):
+                        req_json["user"] = ARGO_USER
+                        body = json.dumps(req_json).encode("utf-8")
+                        print(f"[{method}] /chat/completions: injected user={ARGO_USER} (model={req_json.get('model', '<not set>')})")
+                    else:
+                        print(f"[{method}] /chat/completions: user already set ({existing})")
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                print(f"[{method}] /chat/completions: could not parse body, forwarding as-is")
 
         # Path rewrite logic
         path = self.path
