@@ -185,6 +185,29 @@ To use a specific model (e.g., Opus), add a `"model"` field to your settings:
 
 Without this, Claude Code defaults to Sonnet.
 
+## OpenAI-compatible clients
+
+The shim isn't just for Claude Code — any OpenAI- or Anthropic-format client can
+use it:
+
+- **Authentication.** In addition to `x-api-key`, the shim accepts the shim
+  token via `Authorization: Bearer <token>`, so OpenAI SDKs / clients that only
+  send a bearer token work without modification.
+- **OpenAI & Gemini models.** Argo serves these on
+  `/argoapi/v1/chat/completions` and requires a `user` field set to a valid
+  ALCF username, or it returns `HTTP 500`. The shim auto-injects this for any
+  `/chat/completions` request that doesn't already set `user`. The value is
+  resolved from `$ARGO_USER`, then `$CELS_USERNAME`, then your login username —
+  set `ARGO_USER` if your ALCF username differs.
+
+```bash
+# OpenAI-format request via bearer auth (user field auto-injected by the shim)
+curl http://127.0.0.1:<shim-port>/argoapi/v1/chat/completions \
+     -H "Authorization: Bearer <auth-token>" \
+     -H "content-type: application/json" \
+     -d '{"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]}'
+```
+
 ## Health Checks
 
 The shim runs these automatically on startup. To run them manually:
