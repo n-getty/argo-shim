@@ -190,17 +190,19 @@ Without this, Claude Code defaults to Sonnet.
 The shim isn't just for Claude Code — any OpenAI- or Anthropic-format client can
 use it:
 
-- **Authentication.** In addition to `x-api-key`, the shim accepts its token
-  via `Authorization: Bearer <token>`, so OpenAI SDKs / clients that only send a
-  bearer token work without modification. The `<auth-token>` below is the shim's
-  own access token (not your ALCF/CELS credential) — a random string the shim
-  generates on startup and stores in `~/.claude/settings.json` as the value
-  after `echo` in `apiKeyHelper`. It rotates on each restart. Print the current
-  one with:
+> [!IMPORTANT]
+> **Authentication.** In addition to `x-api-key`, the shim accepts its token via
+> `Authorization: Bearer <token>`, so OpenAI SDKs / clients that only send a
+> bearer token work without modification. This token is the shim's own access
+> token (not your ALCF/CELS credential) — a random string the shim generates on
+> startup and stores in `~/.claude/settings.json` as the value after `echo` in
+> `apiKeyHelper`. It rotates on each restart. Capture the current one into
+> `$token`, which the examples below use:
+>
+> ```bash
+> token=$(python3 -c "import json, os; print(json.load(open(os.path.expanduser('~/.claude/settings.json')))['apiKeyHelper'].split()[-1])")
+> ```
 
-  ```bash
-  python3 -c "import json, os; print(json.load(open(os.path.expanduser('~/.claude/settings.json')))['apiKeyHelper'].split()[-1])"
-  ```
 - **OpenAI & Gemini models.** Argo serves these on
   `/argoapi/v1/chat/completions` and requires a `user` field set to a valid
   ALCF username, or it returns `HTTP 500`. The shim auto-injects this for any
@@ -215,7 +217,7 @@ use it:
   as-is. List the exact ids with:
 
   ```bash
-  curl -H "x-api-key: <auth-token>" http://127.0.0.1:<shim-port>/v1/models
+  curl -H "Authorization: Bearer ${token}" http://127.0.0.1:<shim-port>/v1/models
   ```
 
 Putting it together — a complete request:
@@ -224,7 +226,7 @@ Putting it together — a complete request:
 # OpenAI-format request via bearer auth. The shim auto-injects the user field
 # and normalizes the model name (gpt-4o -> Argo's gpt4o).
 curl http://127.0.0.1:<shim-port>/argoapi/v1/chat/completions \
-     -H "Authorization: Bearer <auth-token>" \
+     -H "Authorization: Bearer ${token}" \
      -H "content-type: application/json" \
      -d '{"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]}'
 ```
