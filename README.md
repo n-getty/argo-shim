@@ -199,9 +199,17 @@ use it:
   `/chat/completions` request that doesn't already set `user`. The value is
   resolved from `$ARGO_USER`, then `$CELS_USERNAME`, then your login username —
   set `ARGO_USER` if your ALCF username differs.
+- **Model names.** Argo expects its own model ids (e.g. `gpt4o`, `GPT-4o`), not
+  the canonical OpenAI/Anthropic/Gemini spellings, and returns `HTTP 400
+  Invalid model` otherwise. The shim normalizes `/chat/completions` model names
+  to Argo's ids, so canonical names like `gpt-4o`, `gpt-4.1`, `claude-opus-4-8`,
+  or `gemini-2.5-pro` work unchanged. Names it doesn't recognize are forwarded
+  as-is. List the exact ids with `curl -H "x-api-key: <auth-token>`
+  `http://127.0.0.1:<shim-port>/v1/models`.
 
 ```bash
-# OpenAI-format request via bearer auth (user field auto-injected by the shim)
+# OpenAI-format request via bearer auth. The shim auto-injects the user field
+# and normalizes the model name (gpt-4o -> Argo's gpt4o).
 curl http://127.0.0.1:<shim-port>/argoapi/v1/chat/completions \
      -H "Authorization: Bearer <auth-token>" \
      -H "content-type: application/json" \
