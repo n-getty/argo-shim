@@ -65,15 +65,23 @@ def build_model_alias_map(models):
     """
     alias = {}
     for m in models:
-        target = m.get("internal_id") or m.get("id")
-        if not target:
+        # Be defensive about upstream shape: skip non-dict entries and only
+        # accept string id/internal_id, so one malformed record can't raise and
+        # take down alias-map construction (which would disable normalization).
+        if not isinstance(m, dict):
             continue
-        for candidate in (m.get("id"), m.get("internal_id")):
-            if candidate:
-                # First writer wins is fine — id and internal_id of the SAME
-                # model both point at the same target, and collapsed forms don't
-                # collide across models (verified against the live model list).
-                alias.setdefault(_collapse_model(candidate), target)
+        ids = [v for v in (m.get("id"), m.get("internal_id"))
+               if isinstance(v, str) and v.strip()]
+        if not ids:
+            continue
+        # Prefer internal_id as the target (what Argo canonically expects); fall
+        # back to id. ids is ordered [id, internal_id], so target is the last.
+        target = ids[-1]
+        for candidate in ids:
+            # First writer wins is fine — id and internal_id of the SAME model
+            # both point at the same target, and collapsed forms don't collide
+            # across models (verified against the live model list).
+            alias.setdefault(_collapse_model(candidate), target)
     return alias
 
 
@@ -781,6 +789,7 @@ class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
             return self._model_alias
 
     def _fetch_model_alias(self):
+        conn = None
         try:
             context = ssl._create_unverified_context()
             conn = http.client.HTTPSConnection(self.target_host, self.target_port,
@@ -789,7 +798,11 @@ class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
                          headers={"Host": REAL_HOST, "x-api-key": API_KEY})
             resp = conn.getresponse()
             raw = resp.read()
-            conn.close()
+            # Treat a non-200 as a fetch failure rather than caching an empty
+            # map: a body that parses but lacks `data` would otherwise silently
+            # disable normalization until restart.
+            if resp.status != 200:
+                raise RuntimeError(f"HTTP {resp.status} from /argoapi/v1/models: {raw[:200]!r}")
             models = json.loads(raw).get("data", [])
             alias = build_model_alias_map(models)
             print(f"  Model alias map: {len(alias)} names -> {len(models)} models")
@@ -798,6 +811,9 @@ class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
             print(f"  ⚠ Could not fetch model list for name normalization: {e} "
                   f"(forwarding model names unchanged)")
             return {}
+        finally:
+            if conn is not None:
+                conn.close()
 
     def recover_tunnel(self):
         """Attempt to recreate the SSH tunnel. Returns True if recovery succeeded."""
