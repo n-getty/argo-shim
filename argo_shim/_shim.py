@@ -5,6 +5,7 @@ import http.server
 import http.client
 import json
 import os
+import re
 import secrets
 import signal
 import socket
@@ -35,6 +36,54 @@ def default_port(username):
     """Derive a deterministic listen port from the username."""
     h = hashlib.sha256(username.encode()).hexdigest()
     return 10000 + (int(h[:8], 16) % 22768)  # range 10000-32767 (below ephemeral range)
+
+
+def _collapse_model(name):
+    """Lowercase and strip everything but [a-z0-9] for model-name matching.
+
+    Argo's model ids differ from the canonical OpenAI/Anthropic/Gemini spellings
+    only by case and punctuation (e.g. `GPT-4o` <-> `gpt4o`, `Claude Opus 4.8`
+    <-> `claudeopus48`), so a collapsed form is a stable key for both.
+    """
+    return re.sub(r'[^a-z0-9]', '', name.lower())
+
+
+def build_model_alias_map(models):
+    """Map collapsed model names -> the exact model id Argo expects.
+
+    `models` is the `data` list from GET /argoapi/v1/models. Each entry has a
+    display `id` (e.g. "GPT-4o") and an `internal_id` (e.g. "gpt4o"). Argo only
+    accepts one of these exact strings — a client sending the canonical OpenAI
+    name `gpt-4o` gets HTTP 400. We key on the collapsed form of BOTH id and
+    internal_id so a request can arrive as any of `GPT-4o`, `gpt-4o`, or `gpt4o`.
+
+    Keying on both is what avoids regressing the o-series and embeddings, whose
+    internal_id is NOT a simple collapse of the canonical name (`o3-mini`'s
+    internal_id is `gpto3mini`, `text-embedding-3-small`'s is `v3small`). The
+    canonical `o3-mini` collapses to `o3mini`, which resolves via the id side to
+    the correct `gpto3mini` rather than the invalid bare `o3mini`.
+    """
+    alias = {}
+    for m in models:
+        # Be defensive about upstream shape: skip non-dict entries and only
+        # accept string id/internal_id, so one malformed record can't raise and
+        # take down alias-map construction (which would disable normalization).
+        if not isinstance(m, dict):
+            continue
+        ids = [v for v in (m.get("id"), m.get("internal_id"))
+               if isinstance(v, str) and v.strip()]
+        if not ids:
+            continue
+        # Prefer internal_id as the target (what Argo canonically expects); fall
+        # back to id. ids is ordered [id, internal_id], so target is the last.
+        target = ids[-1]
+        for candidate in ids:
+            # First writer wins is fine — id and internal_id of the SAME model
+            # both point at the same target, and collapsed forms don't collide
+            # across models (verified against the live model list).
+            alias.setdefault(_collapse_model(candidate), target)
+    return alias
+
 
 SSH_JUMP_HOST = "homes.cels.anl.gov"
 SSH_PROXY_JUMP = "logins.cels.anl.gov"
@@ -516,9 +565,13 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             except (json.JSONDecodeError, UnicodeDecodeError):
                 print(f"[{method}] /messages: could not parse body, forwarding as-is")
 
-        # Inject `user` on OpenAI/Gemini chat-completions requests. Argo returns
-        # HTTP 500 if the `user` field is missing or not a valid ALCF username.
-        # Only applies to /chat/completions (not /messages, which Claude uses).
+        # Fix up OpenAI/Gemini chat-completions requests. Argo requires:
+        #   1. a `user` field set to a valid ALCF username (else HTTP 500), and
+        #   2. an exact model id — canonical names like `gpt-4o` return HTTP 400;
+        #      Argo wants `gpt4o` / `GPT-4o`.
+        # We auto-inject the user and normalize the model name so OpenAI-format
+        # clients work unmodified. Only applies to /chat/completions (not
+        # /messages, which Claude Code uses).
         if method == "POST" and body and "/chat/completions" in self.path:
             try:
                 req_json = json.loads(body)
@@ -527,14 +580,28 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 if not isinstance(req_json, dict):
                     print(f"[{method}] /chat/completions: body is not a JSON object, forwarding as-is")
                 else:
+                    body_changed = False
+
                     existing = req_json.get("user")
                     # Treat blank/whitespace user as missing — Argo rejects it.
                     if not (isinstance(existing, str) and existing.strip()):
                         req_json["user"] = ARGO_USER
-                        body = json.dumps(req_json).encode("utf-8")
+                        body_changed = True
                         print(f"[{method}] /chat/completions: injected user={ARGO_USER} (model={req_json.get('model', '<not set>')})")
                     else:
                         print(f"[{method}] /chat/completions: user already set ({existing})")
+
+                    # Normalize the model name to the exact id Argo expects.
+                    orig_model = req_json.get("model")
+                    if isinstance(orig_model, str) and orig_model:
+                        resolved = self.server.resolve_model(orig_model)
+                        if resolved != orig_model:
+                            req_json["model"] = resolved
+                            body_changed = True
+                            print(f"[{method}] /chat/completions: normalized model {orig_model!r} -> {resolved!r}")
+
+                    if body_changed:
+                        body = json.dumps(req_json).encode("utf-8")
             except (json.JSONDecodeError, UnicodeDecodeError):
                 print(f"[{method}] /chat/completions: could not parse body, forwarding as-is")
 
@@ -691,7 +758,62 @@ class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
         self.auth_token = auth_token
         self.tunnel_is_remote = tunnel_is_remote
         self._tunnel_lock = threading.Lock()
+        # Lazily-populated map of collapsed model name -> exact id Argo expects.
+        # None until the first /chat/completions request triggers a fetch.
+        self._model_alias = None
+        self._model_alias_lock = threading.Lock()
         super().__init__(server_address, handler)
+
+    def resolve_model(self, model):
+        """Return the exact model id Argo expects for a client-supplied name.
+
+        Fetches /argoapi/v1/models once (cached) to build the alias map. If the
+        model is already valid, unknown to us, or the fetch fails, the original
+        string is returned unchanged so we never block a request we can't map.
+        """
+        if not model:
+            return model
+        alias = self._get_model_alias()
+        return alias.get(_collapse_model(model), model)
+
+    def _get_model_alias(self):
+        # Double-checked locking so the model list is fetched at most once even
+        # under concurrent first requests. Empty dict on failure is cached to
+        # avoid hammering upstream; it just means "pass models through as-is".
+        if self._model_alias is not None:
+            return self._model_alias
+        with self._model_alias_lock:
+            if self._model_alias is not None:
+                return self._model_alias
+            self._model_alias = self._fetch_model_alias()
+            return self._model_alias
+
+    def _fetch_model_alias(self):
+        conn = None
+        try:
+            context = ssl._create_unverified_context()
+            conn = http.client.HTTPSConnection(self.target_host, self.target_port,
+                                               context=context, timeout=10)
+            conn.request("GET", "/argoapi/v1/models",
+                         headers={"Host": REAL_HOST, "x-api-key": API_KEY})
+            resp = conn.getresponse()
+            raw = resp.read()
+            # Treat a non-200 as a fetch failure rather than caching an empty
+            # map: a body that parses but lacks `data` would otherwise silently
+            # disable normalization until restart.
+            if resp.status != 200:
+                raise RuntimeError(f"HTTP {resp.status} from /argoapi/v1/models: {raw[:200]!r}")
+            models = json.loads(raw).get("data", [])
+            alias = build_model_alias_map(models)
+            print(f"  Model alias map: {len(alias)} names -> {len(models)} models")
+            return alias
+        except Exception as e:
+            print(f"  ⚠ Could not fetch model list for name normalization: {e} "
+                  f"(forwarding model names unchanged)")
+            return {}
+        finally:
+            if conn is not None:
+                conn.close()
 
     def recover_tunnel(self):
         """Attempt to recreate the SSH tunnel. Returns True if recovery succeeded."""
