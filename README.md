@@ -299,7 +299,7 @@ All SSH commands also use `BatchMode=yes` (no interactive password fallback) and
 
 > **Before anything else:** confirm SSH itself works, independent of argo-shim:
 > ```bash
-> ssh -o BatchMode=yes logins.cels.anl.gov true
+> ssh -o BatchMode=yes -J logins.cels.anl.gov homes.cels.anl.gov true
 > ```
 > If that fails, argo-shim cannot work — fix SSH first (see the table below).
 > **Do not loop on restarting argo-shim** while SSH is broken.
