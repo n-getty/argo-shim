@@ -290,7 +290,7 @@ Common causes of repeated SSH auth failures:
 - Expired Kerberos tickets
 
 To recover from a cooldown or hard lock: **first** make this succeed —
-`ssh -o BatchMode=yes logins.cels.anl.gov true` — then run `argo-shim --reset`
+`ssh -o BatchMode=yes -J logins.cels.anl.gov homes.cels.anl.gov true` — then run `argo-shim --reset`
 (if hard-locked) and start argo-shim again.
 
 All SSH commands also use `BatchMode=yes` (no interactive password fallback) and `ConnectionAttempts=1` to ensure each attempt is a single, non-interactive connection.
