@@ -43,7 +43,7 @@ before you run argo-shim.** Skipping this is the #1 cause of failures.
    ```
 4. **Verify it works.** This must log you in **without a password prompt**:
    ```bash
-   ssh -o BatchMode=yes logins.cels.anl.gov true
+   ssh -o BatchMode=yes -J logins.cels.anl.gov homes.cels.anl.gov true
    ```
    If that command succeeds (no output, no password prompt, exit 0), you're
    ready. If it fails, fix it here — argo-shim cannot work until this does.
