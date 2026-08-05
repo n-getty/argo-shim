@@ -1490,9 +1490,11 @@ def preflight_ssh_checks():
         print("  (Agent forwarding can drop when a laptop sleeps or disconnects.)")
 
     # Always remind users how to verify auth independently of argo-shim.
-    smoke_host = SSH_PROXY_JUMP or SSH_JUMP_HOST
-    print(f"  Tip: confirm SSH works first with  "
-          f"ssh -o BatchMode=yes {smoke_host} true")
+    if SSH_PROXY_JUMP:
+        smoke_cmd = f"ssh -o BatchMode=yes -J {SSH_PROXY_JUMP} {SSH_JUMP_HOST} true"
+    else:
+        smoke_cmd = f"ssh -o BatchMode=yes {SSH_JUMP_HOST} true"
+    print(f"  Tip: confirm SSH works first with  {smoke_cmd}")
     return True
 
 
