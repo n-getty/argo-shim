@@ -231,6 +231,84 @@ curl http://127.0.0.1:<shim-port>/argoapi/v1/chat/completions \
      -d '{"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]}'
 ```
 
+## Using Codex CLI with argo-shim
+
+Codex CLI only speaks the OpenAI **Responses API**, but argo-shim (like Argo
+itself) only implements **Chat Completions**. A small translation gateway,
+[`llm-rosetta`](https://github.com/Oaklight/llm-rosetta), bridges the two:
+
+```
+Codex --(Responses API)--> llm-rosetta gateway --(Chat Completions)--> argo-shim --> Argo
+```
+
+**1. Start argo-shim** as usual (see [Quick Start](#quick-start)) and grab
+its port and auth token:
+
+```bash
+token=$(python3 -c "import json, os; print(json.load(open(os.path.expanduser('~/.claude/settings.json')))['apiKeyHelper'].split()[-1])")
+```
+
+**2. Install and configure llm-rosetta** (requires Python 3.8+; `>=0.7.3`
+to avoid a known upstream bug with null usage fields in Argo's responses):
+
+```bash
+pip install --user 'llm-rosetta>=0.7.3'
+```
+
+`~/.config/llm-rosetta-gateway/config.jsonc`:
+
+```jsonc
+{
+  "providers": {
+    "openai_chat": {
+      "api_key": "<paste $token from step 1>",
+      "base_url": "http://127.0.0.1:<shim-port>/v1"
+    }
+  },
+  "models": {
+    // Argo model ids you want exposed to Codex — see argo-shim's /v1/models
+    "gpt54": "openai_chat",
+    "gpt56sol": "openai_chat"
+  },
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8765,
+    // Required since llm-rosetta 0.7.3, or the gateway 403s every request.
+    "api_key": "<any string — this is what Codex will send back to the gateway>"
+  }
+}
+```
+
+Start the gateway:
+
+```bash
+python3 -m llm_rosetta.gateway
+```
+
+**3. Configure Codex** (`~/.codex/config.toml`) to point at the gateway,
+not at argo-shim directly:
+
+```toml
+model = "gpt54"
+model_provider = "argo"
+
+[model_providers.argo]
+name = "Argo via llm-rosetta gateway"
+base_url = "http://127.0.0.1:8765/v1"
+wire_api = "responses"
+env_key = "ARGO_GATEWAY_KEY"
+```
+
+```bash
+export ARGO_GATEWAY_KEY="<the server.api_key value from step 2>"
+codex
+```
+
+> Pointing Codex's `base_url` straight at argo-shim (skipping the gateway)
+> will fail with `error sending request for url (.../responses)` — argo-shim
+> doesn't implement the Responses API, only Chat Completions and Anthropic
+> Messages.
+
 ## Health Checks
 
 The shim runs these automatically on startup. To run them manually:
