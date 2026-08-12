@@ -28,6 +28,7 @@ API_KEY = os.environ.get("CELS_USERNAME", getpass.getuser())
 # Resolution mirrors API_KEY: $ARGO_USER, else $CELS_USERNAME, else login user.
 ARGO_USER = os.environ.get("ARGO_USER") or os.environ.get("CELS_USERNAME") or getpass.getuser()
 OPENCODE_CONFIG = os.path.expanduser("~/.config/opencode/opencode.json")
+LLM_ROSETTA_CONFIG = os.path.expanduser("~/.config/llm-rosetta-gateway/config.jsonc")
 STATE_PATH = os.path.expanduser("~/.claude/argo-shim-state.json")
 ACCOUNTS_URL = "https://accounts.cels.anl.gov"
 
@@ -1352,6 +1353,154 @@ def update_opencode_settings(tunnel_port, tunnel_host="127.0.0.1"):
     return True
 
 
+def _strip_jsonc_comments(text):
+    """Strip // and /* */ comments from JSONC text, respecting string literals
+    (so "http://..." inside a string value is never mistaken for a comment)."""
+    out = []
+    in_string = False
+    escape = False
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if in_string:
+            out.append(c)
+            if escape:
+                escape = False
+            elif c == "\\":
+                escape = True
+            elif c == '"':
+                in_string = False
+            i += 1
+            continue
+        if c == '"':
+            in_string = True
+            out.append(c)
+            i += 1
+            continue
+        if c == "/" and i + 1 < n and text[i + 1] == "/":
+            while i < n and text[i] != "\n":
+                i += 1
+            continue
+        if c == "/" and i + 1 < n and text[i + 1] == "*":
+            i += 2
+            while i + 1 < n and not (text[i] == "*" and text[i + 1] == "/"):
+                i += 1
+            i += 2
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def _find_jsonc_block_end(text, open_brace_idx):
+    """Given the index of a '{' in JSONC text, return the index just past its
+    matching '}' (string- and comment-aware brace counting). Returns -1 if
+    unbalanced."""
+    depth = 0
+    in_string = False
+    escape = False
+    i, n = open_brace_idx, len(text)
+    while i < n:
+        c = text[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif c == "\\":
+                escape = True
+            elif c == '"':
+                in_string = False
+            i += 1
+            continue
+        if c == '"':
+            in_string = True
+            i += 1
+            continue
+        if c == "/" and i + 1 < n and text[i + 1] == "/":
+            while i < n and text[i] != "\n":
+                i += 1
+            continue
+        if c == "/" and i + 1 < n and text[i + 1] == "*":
+            i += 2
+            while i + 1 < n and not (text[i] == "*" and text[i + 1] == "/"):
+                i += 1
+            i += 2
+            continue
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return -1
+
+
+def update_llm_rosetta_settings(listen_port, auth_token):
+    """Refresh the api_key of whichever llm-rosetta gateway provider points at
+    this shim, so Codex/opencode via the gateway keep working after a token
+    rotation without a manual copy-paste. No-op if the optional gateway config
+    doesn't exist or doesn't reference this shim's port.
+
+    The config is JSONC (JSON + comments), so this patches the target
+    provider's api_key value in place via string/comment-aware brace matching
+    rather than json.load/dump, which would silently drop all comments.
+    """
+    if not auth_token:
+        return  # --no-auth: the shim accepts unauthenticated requests, nothing to sync
+    try:
+        with open(LLM_ROSETTA_CONFIG) as f:
+            text = f.read()
+    except FileNotFoundError:
+        return  # optional integration; most argo-shim users don't have this file
+    except OSError as e:
+        print(f"  ⚠ Could not read {LLM_ROSETTA_CONFIG}: {e}")
+        return
+
+    try:
+        parsed = json.loads(_strip_jsonc_comments(text))
+    except json.JSONDecodeError as e:
+        print(f"  ⚠ Could not parse {LLM_ROSETTA_CONFIG}: {e}")
+        return
+
+    providers = parsed.get("providers", {})
+    port_re = re.compile(r"^https?://(?:127\.0\.0\.1|localhost):" + str(listen_port) + r"(?:/|$)")
+    matches = [name for name, cfg in providers.items()
+               if isinstance(cfg, dict) and port_re.match(cfg.get("base_url", ""))]
+
+    if not matches:
+        return  # no provider currently points at this shim's port
+    if len(matches) > 1:
+        print(f"  ⚠ Multiple llm-rosetta providers point at port {listen_port} — "
+              f"not auto-updating api_key, update {LLM_ROSETTA_CONFIG} manually")
+        return
+
+    providers_key_idx = text.find('"providers"')
+    providers_brace_start = text.find("{", providers_key_idx) if providers_key_idx != -1 else -1
+    providers_block_end = (_find_jsonc_block_end(text, providers_brace_start)
+                            if providers_brace_start != -1 else -1)
+    if providers_block_end == -1:
+        print(f"  ⚠ Could not locate 'providers' block in {LLM_ROSETTA_CONFIG}")
+        return
+
+    provider_name = matches[0]
+    name_idx = text.find(f'"{provider_name}"', providers_brace_start, providers_block_end)
+    brace_start = text.find("{", name_idx) if name_idx != -1 else -1
+    block_end = _find_jsonc_block_end(text, brace_start) if brace_start != -1 else -1
+    if block_end == -1:
+        print(f"  ⚠ Could not locate provider {provider_name!r} block in {LLM_ROSETTA_CONFIG}")
+        return
+
+    block = text[brace_start:block_end]
+    new_block, n = re.subn(r'("api_key"\s*:\s*)"[^"]*"', r'\1"' + auth_token + '"', block, count=1)
+    if n == 0:
+        print(f"  ⚠ No api_key field in llm-rosetta provider {provider_name!r} — add one manually")
+        return
+
+    with open(LLM_ROSETTA_CONFIG, "w") as f:
+        f.write(text[:brace_start] + new_block + text[block_end:])
+    print(f"  ✓ Updated llm-rosetta-gateway config.jsonc api_key (provider {provider_name!r})")
+
+
 def health_check(tunnel_host, tunnel_port, listen_port, auth_token):
     """Validate the full chain: tunnel -> remote endpoint, and shim -> tunnel."""
     print("\nRunning health checks...")
@@ -1503,6 +1652,10 @@ def _run():
     parser.add_argument("--no-auth", action="store_true",
                         help="Disable token authentication on the shim (useful when project-level "
                              "Claude settings override the global apiKeyHelper)")
+    parser.add_argument("--rotate-token", action="store_true",
+                        help="Generate a fresh auth token instead of reusing the existing one. "
+                             "Note: any other config pointed at the shim's current token (e.g. an "
+                             "llm-rosetta gateway) will need restarting to pick up the new one.")
     parser.add_argument("--port", type=int, default=None,
                         help="Listen port for the shim (default: derived from username)")
     parser.add_argument("--tunnel", action="store_true",
@@ -1712,7 +1865,9 @@ def _run():
             if not args.no_update_settings:
                 # Re-sync settings.json in case the port/token drifted, so Claude
                 # Code still points at the live shim.
-                update_claude_settings(listen_port, read_existing_token())
+                existing_token = read_existing_token()
+                update_claude_settings(listen_port, existing_token)
+                update_llm_rosetta_settings(listen_port, existing_token)
             print(f"  To force a fresh start: argo-shim --restart")
             print(f"  To stop it: kill the argo-shim process (or close its terminal).")
             return
@@ -1831,11 +1986,17 @@ def _run():
     check_port_available(listen_port)
     if args.no_auth:
         auth_token = None
-    elif args.tunnel_host:
-        # Reuse the login node's token so its shim stays valid — both nodes share settings.json
-        auth_token = read_existing_token() or secrets.token_urlsafe(32)
-    else:
+    elif args.rotate_token:
         auth_token = secrets.token_urlsafe(32)
+    else:
+        # Reuse the existing token across restarts by default. A fresh token
+        # on every restart forces every static-config consumer of it (e.g.
+        # the llm-rosetta gateway, which reads config.jsonc once at its own
+        # startup and doesn't hot-reload) to also be restarted in lockstep,
+        # or it silently 401s against the shim's new token. Reusing avoids
+        # that class of problem entirely; --rotate-token opts back in for
+        # when you actually want a fresh one (e.g. suspected leak).
+        auth_token = read_existing_token() or secrets.token_urlsafe(32)
 
     if args.no_auth:
         print("⚠ Auth disabled (--no-auth): shim accepts unauthenticated requests on localhost")
@@ -1844,6 +2005,7 @@ def _run():
     if not args.no_update_settings:
         update_claude_settings(listen_port, auth_token)
         print(f"Set ANTHROPIC_BASE_URL=http://127.0.0.1:{listen_port}/argoapi")
+        update_llm_rosetta_settings(listen_port, auth_token)
 
     _raise_thread_limit()
 
