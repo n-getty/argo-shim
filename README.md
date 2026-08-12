@@ -195,8 +195,9 @@ use it:
 > `Authorization: Bearer <token>`, so OpenAI SDKs / clients that only send a
 > bearer token work without modification. This token is the shim's own access
 > token (not your ALCF/CELS credential) — a random string the shim generates on
-> startup and stores in `~/.claude/settings.json` as the value after `echo` in
-> `apiKeyHelper`. It rotates on each restart. Capture the current one into
+> first start and stores in `~/.claude/settings.json` as the value after `echo`
+> in `apiKeyHelper`. It's reused across restarts by default (pass
+> `--rotate-token` to force a fresh one). Capture the current one into
 > `$token`, which the examples below use:
 >
 > ```bash
@@ -241,12 +242,8 @@ itself) only implements **Chat Completions**. A small translation gateway,
 Codex --(Responses API)--> llm-rosetta gateway --(Chat Completions)--> argo-shim --> Argo
 ```
 
-**1. Start argo-shim** as usual (see [Quick Start](#quick-start)) and grab
-its port and auth token:
-
-```bash
-token=$(python3 -c "import json, os; print(json.load(open(os.path.expanduser('~/.claude/settings.json')))['apiKeyHelper'].split()[-1])")
-```
+**1. Start argo-shim** as usual (see [Quick Start](#quick-start)) and note
+its port from the startup output (`✅ Shim running on <port> -> ...`).
 
 **2. Install and configure llm-rosetta** (requires Python 3.8+; `>=0.7.3`
 to avoid a known upstream bug with null usage fields in Argo's responses):
@@ -261,7 +258,7 @@ pip install --user 'llm-rosetta>=0.7.3'
 {
   "providers": {
     "openai_chat": {
-      "api_key": "<paste $token from step 1>",
+      "api_key": "placeholder",
       "base_url": "http://127.0.0.1:<shim-port>/v1"
     }
   },
@@ -279,9 +276,20 @@ pip install --user 'llm-rosetta>=0.7.3'
 }
 ```
 
-Start the gateway:
+> The `"placeholder"` value is fine — as long as `base_url` points at
+> argo-shim's port, argo-shim keeps that provider's `api_key` in sync with
+> its current auth token automatically on every start/restart, no manual
+> copy-paste needed. The token itself is reused across restarts by default, so
+> this is normally a no-op after the first sync. If you pass `--rotate-token`,
+> restart the gateway afterward too — it reads `config.jsonc` once at its own
+> startup and won't pick up the new token otherwise. This only applies to
+> `providers.*.api_key`; `server.api_key` is a separate, gateway-owned secret
+> you set yourself.
+
+Restart argo-shim once to pick up the new config, then start the gateway:
 
 ```bash
+argo-shim --restart
 python3 -m llm_rosetta.gateway
 ```
 
