@@ -12,6 +12,8 @@ uvx argo-shim
 pip install argo-shim
 # then run:
 argo-shim
+# If your ALCF username differs from your CELS username
+CELS_USERNAME=username argo-shim
 ```
 
 ## Prerequisites
