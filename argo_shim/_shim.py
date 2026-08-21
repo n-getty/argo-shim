@@ -7,6 +7,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import signal
 import socket
 import socketserver
@@ -1263,14 +1264,40 @@ def create_reverse_tunnel(remote_host, port):
 
 
 def read_existing_token():
-    """Read the auth token currently stored in settings.json, if any."""
+    """Read the auth token currently stored in settings.json, if any.
+
+    Two independent guards, both needed:
+
+    1. ANTHROPIC_BASE_URL must already look like an argo-shim URL
+       (http://127.0.0.1:<port>/argoapi). Without this, a pre-existing
+       apiKeyHelper from an unrelated setup (a real API key, or another
+       proxy like argo-proxy) gets mistaken for a leftover argo-shim token
+       and written straight back unchanged, so apiKeyHelper never actually
+       gets pointed at the shim.
+
+    2. apiKeyHelper must parse as exactly `echo <token>` with no shell
+       quoting. argo-proxy's documented Claude Code setup writes
+       `echo 'username'` (quoted) — a real shell strips those quotes when
+       Claude Code invokes the helper, but a naive string slice wouldn't,
+       producing a token that never matches what Claude Code actually sends
+       and silently 401s every request. shlex.split parses it the way a
+       real shell would instead.
+
+    Either guard failing falls through to `None`, which mints a fresh token
+    and self-heals both cases.
+    """
     settings_path = os.path.expanduser("~/.claude/settings.json")
     try:
         with open(settings_path) as f:
             settings = json.load(f)
+        base_url = settings.get("env", {}).get("ANTHROPIC_BASE_URL", "")
+        if not re.match(r"^http://127\.0\.0\.1:\d+/argoapi$", base_url):
+            return None
         helper = settings.get("apiKeyHelper", "")
-        if helper.startswith("echo ") and helper[5:] not in ("no-auth", ""):
-            return helper[5:]
+        if helper.startswith("echo "):
+            args = shlex.split(helper[5:])
+            if len(args) == 1 and args[0] not in ("no-auth", ""):
+                return args[0]
     except Exception:
         pass
     return None
