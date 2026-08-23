@@ -509,6 +509,23 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 if auth_hdr.lower().startswith('bearer '):
                     client_key = auth_hdr[7:].strip()
             if method != "HEAD" and client_key != self.server.auth_token:
+                # Drain the request body before replying. protocol_version is
+                # HTTP/1.1, so the connection is keep-alive by default: if we
+                # return without consuming Content-Length bytes, the unread
+                # body stays in the socket buffer and the next read parses it
+                # as a request line. That surfaces in the log as the JSON
+                # payload appearing where the request line belongs, answered
+                # with a spurious 400 that masks the real 401:
+                #   127.0.0.1 - - [...] "{"model":"claude-...","messages":...}" 400 -
+                try:
+                    content_length = int(self.headers.get('Content-Length', 0))
+                except (TypeError, ValueError):
+                    content_length = 0
+                if content_length > 0:
+                    try:
+                        self.rfile.read(content_length)
+                    except (ConnectionResetError, TimeoutError, OSError):
+                        pass
                 self.send_response(401)
                 self.send_header('Content-Type', 'text/plain')
                 msg = b'Unauthorized: invalid or missing x-api-key (or Authorization: Bearer token)'
