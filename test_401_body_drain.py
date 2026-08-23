@@ -17,6 +17,11 @@ payload:
     127.0.0.1 - - [...] "{"model":"claude-...","messages":[...]}POST /..." 501 -
 
 After the fix, the same two requests produce two clean 401s.
+
+Also covers the bounded-drain guard: a body larger than MAX_DRAIN_BYTES is not
+read at all (an unauthenticated caller must not be able to size a buffer via
+Content-Length); the connection is closed after the 401 instead, so there is
+nothing left over to desync a subsequent request.
 """
 import http.server
 import socket
@@ -47,6 +52,49 @@ def _bad_token_post():
     )
 
 
+def _check_oversize_body_closes(port):
+    """A body over MAX_DRAIN_BYTES must still get a 401, and must not be read.
+
+    We declare a huge Content-Length but send only a small prefix. If the
+    handler tried to drain the declared length it would block until the socket
+    timeout; instead it should answer 401 promptly and close.
+    """
+    declared = shim.MAX_DRAIN_BYTES + 1
+    s = socket.create_connection(("127.0.0.1", port), timeout=10)
+    s.sendall(
+        b"POST /argoapi/v1/messages HTTP/1.1\r\n"
+        b"Host: 127.0.0.1\r\n"
+        b"x-api-key: WRONGTOKEN\r\n"
+        b"Content-Type: application/json\r\n"
+        b"Content-Length: " + str(declared).encode() + b"\r\n\r\n" + b"x" * 1024
+    )
+    started = time.monotonic()
+    s.settimeout(5)
+    data = b""
+    try:
+        while True:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+    except (socket.timeout, TimeoutError):
+        pass
+    elapsed = time.monotonic() - started
+    s.close()
+
+    got_401 = b"HTTP/1.1 401" in data
+    closed = data.endswith(b"Bearer token)") or b"close" in data.lower()
+    print(f"oversize: 401={got_401} elapsed={elapsed:.2f}s")
+    if not got_401:
+        print("FAIL: oversize body did not get a 401")
+        return False
+    if elapsed > 4:
+        print("FAIL: handler appears to have waited on the undelivered body")
+        return False
+    print("PASS: oversize body rejected without draining")
+    return True
+
+
 def main():
     srv = _Server(("127.0.0.1", PORT), shim.ProxyHandler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -67,7 +115,6 @@ def main():
     except (socket.timeout, TimeoutError):
         pass
     s.close()
-    srv.shutdown()
 
     # Responses are concatenated with no separator between one body and the
     # next status line, so count status lines rather than splitting on CRLF.
@@ -75,13 +122,18 @@ def main():
     n_other = data.count(b"HTTP/1.1 ") - n_401
     print(f"responses: {n_401} x 401, {n_other} x other")
 
-    if n_401 == 2 and n_other == 0:
+    pipelined_ok = n_401 == 2 and n_other == 0
+    if pipelined_ok:
         print("PASS: both pipelined requests answered 401; body was drained")
-        return 0
-    print("FAIL: expected exactly two 401s and nothing else.")
-    print("      A 501/400 here means the undrained body was parsed as a request line.")
-    print("      raw:", data[:400])
-    return 1
+    else:
+        print("FAIL: expected exactly two 401s and nothing else.")
+        print("      A 501/400 here means the undrained body was parsed as a request line.")
+        print("      raw:", data[:400])
+
+    oversize_ok = _check_oversize_body_closes(PORT)
+
+    srv.shutdown()
+    return 0 if (pipelined_ok and oversize_ok) else 1
 
 
 if __name__ == "__main__":
