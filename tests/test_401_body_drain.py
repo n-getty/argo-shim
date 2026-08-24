@@ -24,12 +24,14 @@ Content-Length); the connection is closed after the 401 instead, so there is
 nothing left over to desync a subsequent request.
 """
 import http.server
+import os
 import socket
 import sys
 import threading
 import time
 
-sys.path.insert(0, __import__("os").path.dirname(__import__("os").path.abspath(__file__)))
+# Repo root, so `argo_shim` imports from the working tree, not an installed copy.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import argo_shim._shim as shim
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 20099
