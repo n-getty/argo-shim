@@ -157,7 +157,7 @@ _SSH_ERROR_HINTS = {
         "CELS rejected your SSH key (authentication failed).\n"
         "  1. Make sure your PUBLIC key is uploaded at " + ACCOUNTS_URL + "\n"
         "  2. Load it into your agent:  ssh-add\n"
-        "  3. Verify by hand:  ssh -o BatchMode=yes " + SSH_PROXY_JUMP + " true\n"
+        "  3. Verify by hand:  {smoke}\n"
         "  Do NOT keep restarting argo-shim until that test succeeds — repeated\n"
         "  failed logins can get this login node's IP blocked for everyone."
     ),
@@ -190,10 +190,16 @@ def _classify_ssh_error(stderr_text):
     transient and must not push the shared IP toward a CSPO block.
     """
     text = (stderr_text or "").lower()
+    # The hints are module-level literals built at import time, before --host
+    # is parsed, so the verify command is a {smoke} placeholder filled in here
+    # — by which point SSH_JUMP_HOST reflects any --host override.
+    def _hint(kind):
+        return _SSH_ERROR_HINTS[kind].replace("{smoke}", _smoke_test_command())
+
     for kind, needles in _SSH_ERROR_SIGNATURES:
         if any(n in text for n in needles):
-            return kind, _SSH_ERROR_HINTS[kind]
-    return "unknown", _SSH_ERROR_HINTS["unknown"]
+            return kind, _hint(kind)
+    return "unknown", _hint("unknown")
 
 
 class SSHAuthError(RuntimeError):
@@ -1688,15 +1694,25 @@ def _local_key_files():
 def _smoke_test_command():
     """The command a user should run to prove SSH to CELS works.
 
-    Deliberately NOT BatchMode: CELS requires a second factor (Duo) after the
-    key is accepted, so a BatchMode login can never succeed, even on a fully
-    working setup. Telling users to verify that way sends them chasing a
-    failure that is expected.
+    Mirrors what create_tunnel actually runs — same BatchMode, same -J through
+    the login node, same destination host — so a pass here means the tunnel
+    will come up, and a failure reproduces the exact thing that is broken.
+    A login-node-only check never touches the ProxyJump path and so cannot
+    tell you that.
 
-    Note `Permission denied (keyboard-interactive)` means the KEY WAS ACCEPTED
-    and only the second factor is outstanding; `(publickey)` is the real
-    key failure. Jumping to an interior host also exercises the ProxyJump path
-    argo-shim actually uses, which a login-node-only check never touches.
+    BatchMode is deliberate for the same reason: it is what the tunnel uses.
+    It succeeds once a master connection is warm (ControlMaster/ControlPersist)
+    or where no second factor is required. If CELS asks for one, this prints
+    the Duo prompt, which is itself informative — that is the step the
+    unattended tunnel cannot perform on its own.
+
+    Reading a failure:
+      * `Permission denied (keyboard-interactive)` — the KEY WAS ACCEPTED;
+        only the second factor is outstanding. Log in interactively once to
+        establish a master connection.
+      * `Permission denied (publickey)` — the real key failure.
+      * `Host key verification failed` — the destination is missing from
+        known_hosts; connect to it interactively once and accept the key.
 
     Uses API_KEY, the login create_tunnel connects as — NOT ARGO_USER, which
     resolves separately and is used for HTTP `user` injection. Where the two
@@ -1705,8 +1721,9 @@ def _smoke_test_command():
     """
     user = API_KEY
     if SSH_PROXY_JUMP:
-        return f"ssh -J {user}@{SSH_PROXY_JUMP} {user}@{SSH_JUMP_HOST}"
-    return f"ssh {user}@{SSH_JUMP_HOST}"
+        return (f"ssh -o BatchMode=yes -J {user}@{SSH_PROXY_JUMP} "
+                f"{user}@{SSH_JUMP_HOST}")
+    return f"ssh -o BatchMode=yes {user}@{SSH_JUMP_HOST}"
 
 
 def _print_first_time_setup_guide():
@@ -1831,7 +1848,7 @@ def _run():
         _ssh_tracker.reset()
         print("✓ SSH failure lockout cleared. Make sure your SSH auth works "
               "before reconnecting:")
-        print(f"    ssh -o BatchMode=yes {SSH_PROXY_JUMP} true")
+        print(f"    {_smoke_test_command()}")
         return
 
     SSH_VERBOSITY = min(args.verbose, 3)

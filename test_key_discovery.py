@@ -14,9 +14,9 @@ What it proves:
   2. Public keys, known_hosts, config etc. are NOT mistaken for private keys.
   3. A genuinely empty ~/.ssh still reports no keys, so the first-time guide
      still fires for the new user it was written for.
-  4. The smoke-test command is not BatchMode and jumps to the interior host.
-     CELS requires a second factor after the key is accepted, so a BatchMode
-     check can never pass and must not be presented as the success criterion.
+  4. The smoke-test command mirrors create_tunnel's real invocation: same
+     BatchMode, same -J through the login node, same destination host. A
+     login-node-only check never exercises the ProxyJump path the tunnel uses.
   5. The smoke-test names API_KEY (the login create_tunnel uses), not
      ARGO_USER (which resolves separately, for HTTP `user` injection). Where
      the two differ, a smoke test naming ARGO_USER can pass for one account
@@ -94,11 +94,31 @@ def main():
         stray = [f for f in found if f.startswith(tmp)]
         results.append(check("empty ~/.ssh reports no keys", stray, []))
 
-    # 4. smoke-test command shape
+    # 4. smoke-test command shape — must match what create_tunnel runs
     cmd = shim._smoke_test_command()
-    results.append(check("smoke test is not BatchMode", "BatchMode" in cmd, False))
-    results.append(check("smoke test jumps to interior host", " -J " in cmd, True))
+    results.append(check("smoke test jumps via the login node", " -J " in cmd, True))
+    results.append(check("smoke test uses BatchMode, like the tunnel",
+                         "BatchMode=yes" in cmd, True))
+    results.append(check("smoke test targets the tunnel's host",
+                         cmd.endswith(shim.SSH_JUMP_HOST), True))
     print(f"      command: {cmd}")
+
+    # 4b. --host must be reflected, and no {smoke} placeholder may leak into
+    # the error hints (they are import-time literals filled in at render).
+    saved_host = shim.SSH_JUMP_HOST
+    try:
+        shim.SSH_JUMP_HOST = "compute-01.cels.anl.gov"
+        hcmd = shim._smoke_test_command()
+        results.append(check("--host is reflected in the smoke test",
+                             hcmd.endswith("@compute-01.cels.anl.gov"), True))
+        _, hint = shim._classify_ssh_error("Permission denied (publickey).")
+        results.append(check("no {smoke} placeholder leaks into hints",
+                             "{smoke}" in hint, False))
+        results.append(check("hint carries the real command",
+                             hcmd in hint, True))
+        print(f"      with --host: {hcmd}")
+    finally:
+        shim.SSH_JUMP_HOST = saved_host
 
     # 5. smoke test must follow the SSH login, not the HTTP user
     import importlib
