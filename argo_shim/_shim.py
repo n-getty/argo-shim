@@ -1603,16 +1603,100 @@ def _agent_has_identities():
     return None
 
 
-def _local_key_files():
-    """Return a list of private SSH key files that exist in ~/.ssh."""
-    ssh_dir = os.path.expanduser("~/.ssh")
-    candidates = ["id_ed25519", "id_ecdsa", "id_rsa", "id_dsa"]
+def _configured_identity_files(hosts):
+    """Return identity files ssh itself would use for `hosts`, per ssh -G.
+
+    This is the authoritative answer: it honours IdentityFile directives in
+    ~/.ssh/config, Include'd files, Match blocks, and per-host aliases, none of
+    which a filename guess can see. Only files that actually exist are
+    returned. Returns [] if ssh -G is unavailable or tells us nothing.
+    """
     found = []
-    for name in candidates:
-        path = os.path.join(ssh_dir, name)
-        if os.path.isfile(path):
-            found.append(path)
+    for host in hosts:
+        if not host:
+            continue
+        try:
+            result = subprocess.run(
+                ["ssh", "-G", host],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                universal_newlines=True, timeout=5,
+            )
+        except Exception:
+            continue
+        if result.returncode != 0:
+            continue
+        for line in result.stdout.splitlines():
+            if not line.lower().startswith("identityfile "):
+                continue
+            path = os.path.expanduser(line.split(None, 1)[1].strip())
+            if os.path.isfile(path) and path not in found:
+                found.append(path)
     return found
+
+
+def _looks_like_private_key(path):
+    """True if `path` is a PEM/OpenSSH private key (not a .pub, config, etc)."""
+    if path.endswith((".pub", ".ppk")) or os.path.basename(path) in (
+        "config", "known_hosts", "known_hosts.old", "authorized_keys", "environment"
+    ):
+        return False
+    try:
+        with open(path, "r", errors="ignore") as fh:
+            return "PRIVATE KEY-----" in fh.read(120)
+    except (OSError, UnicodeDecodeError):
+        return False
+
+
+def _local_key_files():
+    """Return private SSH key files usable for reaching CELS.
+
+    Three sources, widest wins. A user whose key is named anything other than
+    the four stock names (e.g. cels-gce-id_ed25519) was previously told "No SSH
+    key found" while holding a perfectly good, CELS-registered key:
+
+      1. whatever `ssh -G` says it would use for the hosts we actually contact
+      2. the stock id_* names, for when ssh -G is unavailable
+      3. any other file in ~/.ssh whose contents are a private key
+    """
+    ssh_dir = os.path.expanduser("~/.ssh")
+    found = list(_configured_identity_files([SSH_PROXY_JUMP, SSH_JUMP_HOST]))
+
+    for name in ("id_ed25519", "id_ecdsa", "id_rsa", "id_dsa"):
+        path = os.path.join(ssh_dir, name)
+        if os.path.isfile(path) and path not in found:
+            found.append(path)
+
+    try:
+        entries = sorted(os.listdir(ssh_dir))
+    except OSError:
+        entries = []
+    for name in entries:
+        path = os.path.join(ssh_dir, name)
+        if path in found or not os.path.isfile(path):
+            continue
+        if _looks_like_private_key(path):
+            found.append(path)
+
+    return found
+
+
+def _smoke_test_command():
+    """The command a user should run to prove SSH to CELS works.
+
+    Deliberately NOT BatchMode: CELS requires a second factor (Duo) after the
+    key is accepted, so a BatchMode login can never succeed, even on a fully
+    working setup. Telling users to verify that way sends them chasing a
+    failure that is expected.
+
+    Note `Permission denied (keyboard-interactive)` means the KEY WAS ACCEPTED
+    and only the second factor is outstanding; `(publickey)` is the real
+    key failure. Jumping to an interior host also exercises the ProxyJump path
+    argo-shim actually uses, which a login-node-only check never touches.
+    """
+    user = ARGO_USER
+    if SSH_PROXY_JUMP:
+        return f"ssh -J {user}@{SSH_PROXY_JUMP} {user}@{SSH_JUMP_HOST}"
+    return f"ssh {user}@{SSH_JUMP_HOST}"
 
 
 def _print_first_time_setup_guide():
@@ -1632,8 +1716,8 @@ def _print_first_time_setup_guide():
     print("      (SSH Keys section — paste the .pub contents, not the private key)\n")
     print("   4. Load the key into your agent:")
     print("        ssh-add\n")
-    print("   5. Verify it works (this should log you in WITHOUT a password):")
-    print(f"        ssh -o BatchMode=yes {SSH_PROXY_JUMP} true\n")
+    print("   5. Verify it works (key, then your second factor when prompted):")
+    print(f"        {_smoke_test_command()}\n")
     print("  Only once step 5 succeeds will argo-shim be able to connect.")
     print("  We're stopping here on purpose: attempting SSH without a working")
     print("  key just produces failed logins that can get this shared login")
@@ -1666,11 +1750,7 @@ def preflight_ssh_checks():
         print("  (Agent forwarding can drop when a laptop sleeps or disconnects.)")
 
     # Always remind users how to verify auth independently of argo-shim.
-    if SSH_PROXY_JUMP:
-        smoke_cmd = f"ssh -o BatchMode=yes -J {SSH_PROXY_JUMP} {SSH_JUMP_HOST} true"
-    else:
-        smoke_cmd = f"ssh -o BatchMode=yes {SSH_JUMP_HOST} true"
-    print(f"  Tip: confirm SSH works first with  {smoke_cmd}")
+    print(f"  Tip: confirm SSH works first with  {_smoke_test_command()}")
     return True
 
 
