@@ -2,7 +2,7 @@
 # Reproduces Vertex AI 500 "Streaming is required" error.
 # Sends a large tool-result payload with stream=false to the shim.
 #
-# Usage: ./test_stream_500.sh
+# Usage: ./tests/test_stream_500.sh   (from the repo root)
 #
 # Reads port and auth token from ~/.claude/settings.json automatically.
 # If the shim is forcing stream=true, this should succeed (SSE response).
