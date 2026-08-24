@@ -23,17 +23,28 @@ WATCH_SECONDS = 330    # must exceed CONNECTION_IDLE_TIMEOUT (305) with margin
 POLL = 5
 
 
+def _run(cmd):
+    """subprocess.run, but exit with a clear message if the tool is missing.
+
+    This test shells out to lsof and ps; without them the failure is an
+    unhandled FileNotFoundError deep in a helper, which reads like a bug in
+    the test rather than a missing prerequisite.
+    """
+    try:
+        return subprocess.run(cmd, stdout=subprocess.PIPE, universal_newlines=True)
+    except FileNotFoundError:
+        sys.exit(f"FAIL: `{cmd[0]}` not found on PATH; this test needs lsof and ps.")
+
+
 def shim_pid(port):
-    out = subprocess.run(
+    out = _run(
         ["lsof", "-ti", f"TCP:{port}", "-sTCP:LISTEN"],
-        stdout=subprocess.PIPE, universal_newlines=True,
     ).stdout.strip().split("\n")
     return out[0] if out and out[0] else None
 
 
 def nlwp(pid):
-    r = subprocess.run(["ps", "-o", "nlwp=", "-p", pid],
-                       stdout=subprocess.PIPE, universal_newlines=True)
+    r = _run(["ps", "-o", "nlwp=", "-p", pid])
     s = r.stdout.strip()
     return int(s) if s else -1
 
