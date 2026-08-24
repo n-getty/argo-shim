@@ -17,6 +17,10 @@ What it proves:
   4. The smoke-test command is not BatchMode and jumps to the interior host.
      CELS requires a second factor after the key is accepted, so a BatchMode
      check can never pass and must not be presented as the success criterion.
+  5. The smoke-test names API_KEY (the login create_tunnel uses), not
+     ARGO_USER (which resolves separately, for HTTP `user` injection). Where
+     the two differ, a smoke test naming ARGO_USER can pass for one account
+     while the tunnel still fails for the other.
 """
 import os
 import sys
@@ -95,6 +99,24 @@ def main():
     results.append(check("smoke test is not BatchMode", "BatchMode" in cmd, False))
     results.append(check("smoke test jumps to interior host", " -J " in cmd, True))
     print(f"      command: {cmd}")
+
+    # 5. smoke test must follow the SSH login, not the HTTP user
+    import importlib
+    saved = dict(os.environ)
+    try:
+        os.environ["CELS_USERNAME"] = "sshlogin"
+        os.environ["ARGO_USER"] = "httpuser"
+        reloaded = importlib.reload(shim)
+        cmd2 = reloaded._smoke_test_command()
+        results.append(check("smoke test uses the SSH login (API_KEY)",
+                             "sshlogin@" in cmd2, True))
+        results.append(check("smoke test ignores ARGO_USER",
+                             "httpuser" in cmd2, False))
+        print(f"      command: {cmd2}")
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+        importlib.reload(shim)
 
     print()
     if all(results):

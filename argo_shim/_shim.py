@@ -1610,6 +1610,11 @@ def _configured_identity_files(hosts):
     ~/.ssh/config, Include'd files, Match blocks, and per-host aliases, none of
     which a filename guess can see. Only files that actually exist are
     returned. Returns [] if ssh -G is unavailable or tells us nothing.
+
+    Queried as `-l API_KEY`, the same login create_tunnel connects as, so a
+    config using `Match user` / per-user IdentityFile rules resolves to the
+    keys that will really be offered rather than the ones for whoever happens
+    to be running the shim.
     """
     found = []
     for host in hosts:
@@ -1617,7 +1622,7 @@ def _configured_identity_files(hosts):
             continue
         try:
             result = subprocess.run(
-                ["ssh", "-G", host],
+                ["ssh", "-G", "-l", API_KEY, host],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                 universal_newlines=True, timeout=5,
             )
@@ -1692,8 +1697,13 @@ def _smoke_test_command():
     and only the second factor is outstanding; `(publickey)` is the real
     key failure. Jumping to an interior host also exercises the ProxyJump path
     argo-shim actually uses, which a login-node-only check never touches.
+
+    Uses API_KEY, the login create_tunnel connects as — NOT ARGO_USER, which
+    resolves separately and is used for HTTP `user` injection. Where the two
+    differ, a smoke test naming ARGO_USER can pass for one account while the
+    tunnel still fails for the other.
     """
-    user = ARGO_USER
+    user = API_KEY
     if SSH_PROXY_JUMP:
         return f"ssh -J {user}@{SSH_PROXY_JUMP} {user}@{SSH_JUMP_HOST}"
     return f"ssh {user}@{SSH_JUMP_HOST}"
