@@ -26,7 +26,8 @@ import os
 import sys
 import tempfile
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Repo root, so `argo_shim` imports from the working tree, not an installed copy.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import argo_shim._shim as shim
 
 STOCK = "id_ed25519"
