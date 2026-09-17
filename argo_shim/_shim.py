@@ -107,6 +107,16 @@ CONNECTION_IDLE_TIMEOUT = 305
 DRAIN_CHUNK_SIZE = 64 * 1024
 MAX_DRAIN_BYTES = 8 * 1024 * 1024
 
+# Wall-clock ceiling on a single drain. CONNECTION_IDLE_TIMEOUT is a
+# PER-OPERATION socket timeout, so it does not bound the drain loop as a whole:
+# a client trickling one byte every few minutes renews it on every read and
+# pins the handler thread indefinitely — before any auth has succeeded. That
+# matters here because the per-user thread cap on ALCF login nodes is low
+# enough that leaked handler threads have crashed the shim before (the idle
+# reaping fix above). A whole-loop deadline bounds it: past this, stop reading
+# and close. Well above any legitimate body transfer to localhost.
+MAX_DRAIN_SECONDS = 10
+
 # Failure/lockout policy. Retries to CELS rarely change the outcome (a broken
 # key stays broken) but each failed auth pushes the shared login-node IP closer
 # to a CSPO block, so we keep these deliberately small.
@@ -528,20 +538,41 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 #
                 # Discard in bounded chunks rather than one read(content_length):
                 # this path is reachable by unauthenticated callers, so it must
-                # not size a buffer from a client-supplied header. Past
-                # MAX_DRAIN_BYTES, close the connection instead — there is then
-                # nothing left in the buffer to desync the next request.
+                # not size a buffer from a client-supplied header.
+                #
+                # Draining is only safe when we know exactly how many bytes to
+                # discard. Anything else — a chunked body, a negative or
+                # unparsable length, or more than MAX_DRAIN_BYTES — gets the
+                # connection closed instead. Closing is always a correct
+                # fallback: it costs the client a reconnect, but a closed
+                # socket has no leftover bytes to desync a later request.
                 try:
                     content_length = int(self.headers.get('Content-Length', 0))
                 except (TypeError, ValueError):
                     content_length = 0
-                if content_length > MAX_DRAIN_BYTES:
+                # Chunked bodies are framed by the chunk headers, not by
+                # Content-Length, so there is no count to drain: reading
+                # content_length bytes would leave the chunk trailers behind
+                # and desync exactly the way this fix exists to prevent.
+                chunked = 'chunked' in self.headers.get('Transfer-Encoding', '').lower()
+                if chunked or content_length < 0 or content_length > MAX_DRAIN_BYTES:
                     self.close_connection = True
                 elif content_length > 0:
                     remaining = content_length
+                    deadline = time.monotonic() + MAX_DRAIN_SECONDS
                     try:
                         while remaining > 0:
-                            chunk = self.rfile.read(min(DRAIN_CHUNK_SIZE, remaining))
+                            if time.monotonic() > deadline:
+                                # Slow-dribbling client; stop feeding it our
+                                # handler thread (see MAX_DRAIN_SECONDS).
+                                self.close_connection = True
+                                break
+                            # read1(), not read(): rfile is a BufferedReader,
+                            # whose read(n) blocks until it has all n bytes, so
+                            # the deadline above would never be re-checked
+                            # against a slow client. read1() returns whatever
+                            # one syscall yields, so the loop keeps ticking.
+                            chunk = self.rfile.read1(min(DRAIN_CHUNK_SIZE, remaining))
                             if not chunk:
                                 # Client stopped early; the body we were told to
                                 # expect never arrived, so the stream is unusable.
