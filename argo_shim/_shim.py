@@ -99,6 +99,24 @@ SSH_VERBOSITY = 0
 # and this only ever reaps connections that are truly idle between requests.
 CONNECTION_IDLE_TIMEOUT = 305
 
+# Draining a rejected request's body keeps the keep-alive connection in sync
+# (see the 401 branch in handle_proxy). Discard it in bounded chunks so an
+# unauthenticated caller can't make us allocate an arbitrary buffer, and give
+# up past a ceiling — beyond that, closing the connection is cheaper than
+# reading the body just to throw it away, and the client must reconnect.
+DRAIN_CHUNK_SIZE = 64 * 1024
+MAX_DRAIN_BYTES = 8 * 1024 * 1024
+
+# Wall-clock ceiling on a single drain. CONNECTION_IDLE_TIMEOUT is a
+# PER-OPERATION socket timeout, so it does not bound the drain loop as a whole:
+# a client trickling one byte every few minutes renews it on every read and
+# pins the handler thread indefinitely — before any auth has succeeded. That
+# matters here because the per-user thread cap on ALCF login nodes is low
+# enough that leaked handler threads have crashed the shim before (the idle
+# reaping fix above). A whole-loop deadline bounds it: past this, stop reading
+# and close. Well above any legitimate body transfer to localhost.
+MAX_DRAIN_SECONDS = 10
+
 # Failure/lockout policy. Retries to CELS rarely change the outcome (a broken
 # key stays broken) but each failed auth pushes the shared login-node IP closer
 # to a CSPO block, so we keep these deliberately small.
@@ -509,6 +527,60 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 if auth_hdr.lower().startswith('bearer '):
                     client_key = auth_hdr[7:].strip()
             if method != "HEAD" and client_key != self.server.auth_token:
+                # Drain the request body before replying. protocol_version is
+                # HTTP/1.1, so the connection is keep-alive by default: if we
+                # return without consuming Content-Length bytes, the unread
+                # body stays in the socket buffer and the next read parses it
+                # as a request line. That surfaces in the log as the JSON
+                # payload appearing where the request line belongs, answered
+                # with a spurious 501/400 that masks the real 401:
+                #   127.0.0.1 - - [...] "{"model":"claude-...",...}POST /..." 501 -
+                #
+                # Discard in bounded chunks rather than one read(content_length):
+                # this path is reachable by unauthenticated callers, so it must
+                # not size a buffer from a client-supplied header.
+                #
+                # Draining is only safe when we know exactly how many bytes to
+                # discard. Anything else — a chunked body, a negative or
+                # unparsable length, or more than MAX_DRAIN_BYTES — gets the
+                # connection closed instead. Closing is always a correct
+                # fallback: it costs the client a reconnect, but a closed
+                # socket has no leftover bytes to desync a later request.
+                try:
+                    content_length = int(self.headers.get('Content-Length', 0))
+                except (TypeError, ValueError):
+                    content_length = 0
+                # Chunked bodies are framed by the chunk headers, not by
+                # Content-Length, so there is no count to drain: reading
+                # content_length bytes would leave the chunk trailers behind
+                # and desync exactly the way this fix exists to prevent.
+                chunked = 'chunked' in self.headers.get('Transfer-Encoding', '').lower()
+                if chunked or content_length < 0 or content_length > MAX_DRAIN_BYTES:
+                    self.close_connection = True
+                elif content_length > 0:
+                    remaining = content_length
+                    deadline = time.monotonic() + MAX_DRAIN_SECONDS
+                    try:
+                        while remaining > 0:
+                            if time.monotonic() > deadline:
+                                # Slow-dribbling client; stop feeding it our
+                                # handler thread (see MAX_DRAIN_SECONDS).
+                                self.close_connection = True
+                                break
+                            # read1(), not read(): rfile is a BufferedReader,
+                            # whose read(n) blocks until it has all n bytes, so
+                            # the deadline above would never be re-checked
+                            # against a slow client. read1() returns whatever
+                            # one syscall yields, so the loop keeps ticking.
+                            chunk = self.rfile.read1(min(DRAIN_CHUNK_SIZE, remaining))
+                            if not chunk:
+                                # Client stopped early; the body we were told to
+                                # expect never arrived, so the stream is unusable.
+                                self.close_connection = True
+                                break
+                            remaining -= len(chunk)
+                    except (ConnectionResetError, TimeoutError, OSError):
+                        self.close_connection = True
                 self.send_response(401)
                 self.send_header('Content-Type', 'text/plain')
                 msg = b'Unauthorized: invalid or missing x-api-key (or Authorization: Bearer token)'
