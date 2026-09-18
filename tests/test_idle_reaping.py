@@ -11,16 +11,50 @@ blocked in readline; with ProxyHandler.timeout set, the SERVER reaps them after
 the idle timeout even though the client keeps the sockets open. Thread count
 (nlwp) should rise by ~N, then fall back toward baseline ~timeout seconds later.
 """
+import json
+import os
+import re
 import socket
 import subprocess
 import sys
 import time
 
-LISTEN_PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 20098
 N = 30                 # connections to open
 SEND_HEAD = True       # simulate a real keep-alive client (HEAD is local-only)
 WATCH_SECONDS = 330    # must exceed CONNECTION_IDLE_TIMEOUT (305) with margin
 POLL = 5
+
+SETTINGS = os.path.expanduser("~/.claude/settings.json")
+
+
+def listen_port(argv):
+    """Resolve the shim's listen port: argv[1], else settings.json.
+
+    There is no universal default to fall back on — default_port() derives the
+    port from a hash of the username, so it differs per user. Read it from the
+    settings.json the shim itself writes, the same way test_stream_500.sh
+    finds its endpoint, and say so plainly when that is not possible.
+    """
+    if len(argv) > 1:
+        try:
+            return int(argv[1])
+        except ValueError:
+            sys.exit(f"FAIL: `{argv[1]}` is not a port number.")
+
+    try:
+        with open(SETTINGS) as fh:
+            url = json.load(fh)["env"]["ANTHROPIC_BASE_URL"]
+    except (IOError, OSError, ValueError, KeyError):
+        sys.exit(
+            f"FAIL: could not read ANTHROPIC_BASE_URL from {SETTINGS}.\n"
+            "Start the shim first, or pass the port explicitly: "
+            "python3 tests/test_idle_reaping.py <port>"
+        )
+
+    m = re.search(r":(\d+)", url)
+    if not m:
+        sys.exit(f"FAIL: no port in ANTHROPIC_BASE_URL ({url}).")
+    return int(m.group(1))
 
 
 def _run(cmd):
@@ -37,9 +71,7 @@ def _run(cmd):
 
 
 def shim_pid(port):
-    out = _run(
-        ["lsof", "-ti", f"TCP:{port}", "-sTCP:LISTEN"],
-    ).stdout.strip().split("\n")
+    out = _run(["lsof", "-ti", f"TCP:{port}", "-sTCP:LISTEN"]).stdout.strip().split("\n")
     return out[0] if out and out[0] else None
 
 
@@ -50,18 +82,22 @@ def nlwp(pid):
 
 
 def main():
-    pid = shim_pid(LISTEN_PORT)
+    # Resolved here rather than at import time: a module-level sys.argv[1]
+    # turns any accidental `pytest tests/` into a collection-time crash.
+    port = listen_port(sys.argv)
+
+    pid = shim_pid(port)
     if not pid:
-        print(f"FAIL: no shim listening on {LISTEN_PORT}")
+        print(f"FAIL: no shim listening on {port}")
         return 1
-    print(f"shim pid={pid} on port {LISTEN_PORT}, timeout-reaping test")
+    print(f"shim pid={pid} on port {port}, timeout-reaping test")
 
     base = nlwp(pid)
     print(f"baseline threads (nlwp): {base}")
 
     socks = []
     for _ in range(N):
-        s = socket.create_connection(("127.0.0.1", LISTEN_PORT), timeout=5)
+        s = socket.create_connection(("127.0.0.1", port), timeout=5)
         if SEND_HEAD:
             # HEAD to the base path: do_HEAD answers 200 locally, then the
             # HTTP/1.1 connection stays open (keep-alive) -> thread idles in
