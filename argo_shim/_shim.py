@@ -1621,6 +1621,15 @@ def _configured_identity_files(hosts):
     config using `Match user` / per-user IdentityFile rules resolves to the
     keys that will really be offered rather than the ones for whoever happens
     to be running the shim.
+
+    NOT a side-effect-free parse: `ssh -G` evaluates `Match exec` blocks, so a
+    config containing one runs that command here. It is the user's own config
+    and ssh would run it moments later anyway, but it means preflight can block
+    on e.g. a gpg unlock — hence the timeout, which bounds it at 5s per host.
+
+    Note `ssh -G` resolves `~` via getpwuid(), not $HOME, so it always reads the
+    invoking user's real ~/.ssh regardless of environment. Tests that fake HOME
+    must stub this function rather than expect isolation from it.
     """
     found = []
     for host in hosts:
@@ -1691,20 +1700,30 @@ def _local_key_files():
     return found
 
 
-def _smoke_test_command():
+def _smoke_test_command(interactive=False):
     """The command a user should run to prove SSH to CELS works.
 
     Mirrors what create_tunnel actually runs — same BatchMode, same -J through
-    the login node, same destination host — so a pass here means the tunnel
-    will come up, and a failure reproduces the exact thing that is broken.
-    A login-node-only check never touches the ProxyJump path and so cannot
-    tell you that.
+    the login node, same destination host, same ControlPath — so a pass here
+    means the tunnel will come up, and a failure reproduces the exact thing
+    that is broken. A login-node-only check never touches the ProxyJump path
+    and so cannot tell you that.
+
+    ControlPath is part of that mirror, not decoration. create_tunnel uses
+    ~/.ssh/argo-shim-%C; without naming it here the smoke test would resolve
+    whatever the user's own config sets (commonly ~/.ssh/control-%r@%h:%p) and
+    land in a different socket namespace — so a warm argo-shim master would not
+    make this pass, nor this one help the tunnel. %C hashes host/port/user/jump
+    but NOT -L, so the tunnel's forward does not change the socket name and the
+    two genuinely share one master.
 
     BatchMode is deliberate for the same reason: it is what the tunnel uses.
     It succeeds once a master connection is warm (ControlMaster/ControlPersist)
-    or where no second factor is required. If CELS asks for one, this prints
-    the Duo prompt, which is itself informative — that is the step the
-    unattended tunnel cannot perform on its own.
+    or where no second factor is required. On a COLD connection to CELS, which
+    requires a second factor, BatchMode cannot complete — that is expected, and
+    the failure is still the useful signal (see below). Log in interactively
+    once to establish the master, then this passes: exactly the sequence the
+    unattended tunnel needs, since the tunnel cannot answer Duo on its own.
 
     Reading a failure:
       * `Permission denied (keyboard-interactive)` — the KEY WAS ACCEPTED;
@@ -1718,12 +1737,19 @@ def _smoke_test_command():
     resolves separately and is used for HTTP `user` injection. Where the two
     differ, a smoke test naming ARGO_USER can pass for one account while the
     tunnel still fails for the other.
+
+    Pass interactive=True for the variant shown to a brand-new user: same path
+    and same ControlPath, but WITHOUT BatchMode, so Duo can actually prompt.
+    That is the run which establishes the master; the BatchMode form is what
+    to re-run afterwards to confirm the unattended tunnel will now work.
     """
     user = API_KEY
+    control = "-o ControlPath=~/.ssh/argo-shim-%C"
+    batch = "" if interactive else "-o BatchMode=yes "
     if SSH_PROXY_JUMP:
-        return (f"ssh -o BatchMode=yes -J {user}@{SSH_PROXY_JUMP} "
+        return (f"ssh {batch}{control} -J {user}@{SSH_PROXY_JUMP} "
                 f"{user}@{SSH_JUMP_HOST}")
-    return f"ssh -o BatchMode=yes {user}@{SSH_JUMP_HOST}"
+    return f"ssh {batch}{control} {user}@{SSH_JUMP_HOST}"
 
 
 def _print_first_time_setup_guide():
@@ -1744,7 +1770,11 @@ def _print_first_time_setup_guide():
     print("   4. Load the key into your agent:")
     print("        ssh-add\n")
     print("   5. Verify it works (key, then your second factor when prompted):")
-    print(f"        {_smoke_test_command()}\n")
+    print(f"        {_smoke_test_command(interactive=True)}\n")
+    print("      If that logs you in, you're done — Ctrl-D back out and re-run")
+    print("      argo-shim. 'Permission denied (keyboard-interactive)' means the")
+    print("      KEY WAS ACCEPTED and only the second factor is outstanding;")
+    print("      only '(publickey)' is an actual key problem.\n")
     print("  Only once step 5 succeeds will argo-shim be able to connect.")
     print("  We're stopping here on purpose: attempting SSH without a working")
     print("  key just produces failed logins that can get this shared login")
