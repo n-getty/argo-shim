@@ -158,6 +158,63 @@ MAX_SSH_FAILURES = 2        # consecutive auth-type failures before a cooldown
 COOLDOWN_SECONDS = 900      # 15-minute timed cooldown after MAX_SSH_FAILURES
 MAX_COOLDOWN_CYCLES = 2     # cooldowns endured before escalating to a hard lock
 
+# Fingerprints of errors that Argo's own backend raised and handed us as text.
+# Argo is a Python service using requests/urllib3, so its internal tracebacks
+# leak library-specific strings that the shim itself cannot produce: argo-shim
+# is stdlib-only (http.client), so a "HTTPSConnectionPool" or a reference to a
+# cloud provider's auth host in an error body can only have come from upstream.
+# Matching these lets us say plainly whose problem it is. The common case is
+# Argo failing to mint a Google OAuth token for the Vertex backend that serves
+# Claude models, which surfaces as a connection error to oauth2.googleapis.com
+# and otherwise reads like a local network fault.
+UPSTREAM_FAULT_MARKERS = (
+    "httpsconnectionpool",
+    "httpconnectionpool",
+    "oauth2.googleapis.com",
+    "newconnectionerror",
+    "max retries exceeded",
+    "sts.amazonaws.com",
+    "login.microsoftonline.com",
+)
+
+
+def classify_upstream_error(err_msg, err_type=""):
+    """Map an upstream error string to (http_status, explanation or None).
+
+    Returns the status to send the client and, when we can attribute the fault,
+    a short sentence naming the responsible layer. The explanation exists
+    because the client's own advice for a bare 5xx is to check the local
+    gateway, which is exactly wrong for a failure that happened inside Argo.
+
+    Ordering matters: the specific upstream-fault check runs before the generic
+    numeric sniffs, because a requests traceback often embeds unrelated digits
+    (ports, errnos) that would otherwise match the 401/403 substring test. For
+    example "port=443 ... [Errno 111]" contains no 401, but a "Connection
+    refused on 127.0.0.1:8403" style message would.
+    """
+    text = (err_msg or "").lower()
+
+    if any(marker in text for marker in UPSTREAM_FAULT_MARKERS):
+        provider = "its Vertex AI backend" if "googleapis" in text else "an upstream provider"
+        return 502, (
+            "This is an Argo-side failure, NOT a problem with argo-shim, your SSH "
+            "tunnel, or your machine. Argo could not reach {}. Nothing to fix "
+            "locally; it is usually transient, so retry in a few minutes. If it "
+            "persists, report it to Argo/CELS support.".format(provider))
+
+    if "429" in text or "resource_exhausted" in text or "quota exceeded" in text:
+        return 429, "Argo rate limit or quota exceeded upstream (not a shim problem)."
+    if err_type == "overloaded_error" or "overloaded_error" in text:
+        return 529, "The upstream model provider is overloaded (not a shim problem)."
+    if err_type == "invalid_request_error" or "invalid_request_error" in text or "error code: 400" in text:
+        return 400, None          # genuinely the caller's request; no attribution needed
+    if "401" in text or "403" in text or "unauthorized" in text:
+        return 401, "Argo rejected the credentials (not a shim problem). Check your CELS access."
+
+    return 503, ("argo-shim reached Argo, but Argo returned an error it did not "
+                 "classify. The request failed upstream, not in the shim.")
+
+
 # SSH failure classifications. Only these "kinds" count toward the lockout —
 # a network outage or a busy local port is not a failed authentication and
 # must not push us toward a CSPO IP block.
@@ -749,16 +806,19 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     continue
                 if _ssh_tracker.is_blocked():
                     print(f"[{method}] SSH retry limit reached — not attempting recovery")
-                    self._send_error(503, "SSH tunnel recovery disabled after repeated auth failures. "
-                                          "Fix SSH authentication and restart argo-shim.")
+                    self._send_error(503, "[argo-shim] LOCAL problem (not an Argo outage): SSH "
+                                          "tunnel recovery is disabled after repeated auth "
+                                          "failures. Fix SSH authentication and restart argo-shim.")
                 else:
                     print(f"[{method}] Upstream connection refused (tunnel is down)")
-                    self._send_error(502, "Bad Gateway: SSH tunnel is down. Restart argo-shim.")
+                    self._send_error(502, "[argo-shim] LOCAL problem (not an Argo outage): the SSH "
+                                          "tunnel is down. Restart argo-shim.")
                 return
             except Exception as e:
                 conn.close()
                 print(f"[{method}] Upstream error: {e}")
-                self._send_error(502, f"Bad Gateway: {e}")
+                self._send_error(502, f"[argo-shim] LOCAL problem (not an Argo outage): the shim "
+                                      f"could not reach Argo through the SSH tunnel: {e}")
                 return
 
         try:
@@ -778,23 +838,24 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     print(f"[{method}] Reassembled streaming response into non-streaming JSON")
                 else:
                     if message:  # SSE error event
-                        error_body = json.dumps(message).encode("utf-8")
                         err_type = message.get("error", {}).get("type", "")
                         err_msg = message.get("error", {}).get("message", "")
-                        if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg or "Quota exceeded" in err_msg:
-                            http_status = 429
-                        elif err_type == "overloaded_error" or "overloaded_error" in err_msg:
-                            http_status = 529
-                        elif err_type == "invalid_request_error" or "invalid_request_error" in err_msg or "Error code: 400" in err_msg:
-                            http_status = 400
-                        elif "401" in err_msg or "403" in err_msg or "unauthorized" in err_msg.lower():
-                            http_status = 401
-                        else:
-                            http_status = 503
+                        http_status, explanation = classify_upstream_error(err_msg, err_type)
+                        if explanation:
+                            # Prepend the attribution to the message the client
+                            # will surface, so the user sees whose fault it is
+                            # without having to read the shim's console output.
+                            message.setdefault("error", {})["message"] = (
+                                "[argo-shim] {}\n\nUpstream error: {}".format(explanation, err_msg))
+                        error_body = json.dumps(message).encode("utf-8")
                         print(f"[{method}] SSE error (HTTP {http_status}): {err_msg[:200]}")
+                        if explanation:
+                            print(f"[{method}] → {explanation}")
                     else:
                         error_body = json.dumps({"type": "error", "error": {"type": "api_error",
-                            "message": "Shim failed to reassemble streaming response"}}).encode()
+                            "message": "[argo-shim] The shim could not parse Argo's streaming "
+                                       "response. This one IS a shim-side failure — please "
+                                       "report it with the console output above."}}).encode()
                         http_status = 502
                         print(f"[{method}] SSE reassembly failed, could not parse upstream response")
                     self.send_response(http_status)
@@ -809,8 +870,25 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             if response.status >= 400:
                 error_body = response.read()
                 print(f"[{method}] Upstream {response.status}: {error_body[:500]}")
+                # Non-streamed upstream error. The status line is already on the
+                # wire so we cannot reclassify it, but we can still tell the user
+                # whose fault it is. Only annotate when the body is JSON shaped
+                # the way we expect — otherwise pass it through untouched rather
+                # than risk mangling a shape some client parses.
+                try:
+                    parsed = json.loads(error_body)
+                    upstream_msg = parsed.get("error", {}).get("message", "")
+                    _, explanation = classify_upstream_error(
+                        upstream_msg, parsed.get("error", {}).get("type", ""))
+                    if explanation and upstream_msg:
+                        parsed["error"]["message"] = (
+                            "[argo-shim] {}\n\nUpstream error: {}".format(explanation, upstream_msg))
+                        error_body = json.dumps(parsed).encode("utf-8")
+                        print(f"[{method}] → {explanation}")
+                except (ValueError, AttributeError, TypeError):
+                    pass
                 for k, v in response.getheaders():
-                    if k.lower() not in ('transfer-encoding',):
+                    if k.lower() not in ('transfer-encoding', 'content-length'):
                         self.send_header(k, v)
                 self.send_header('Content-Length', str(len(error_body)))
                 self.end_headers()
