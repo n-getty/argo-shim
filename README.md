@@ -319,6 +319,81 @@ codex
 > doesn't implement the Responses API, only Chat Completions and Anthropic
 > Messages.
 
+## Using pi with argo-shim
+
+[pi](https://omp.sh) (`omp`) needs no translation gateway: it speaks both wire
+formats argo-shim implements, and picks one per model.
+
+```
+pi --(Anthropic Messages, Claude models)--> argo-shim --> Argo
+   --(Chat Completions, everything else)-->
+```
+
+Start the shim with `--pi`:
+
+```bash
+argo-shim --pi
+```
+
+That writes a managed `argo` provider into `~/.omp/agent/models.yml`, listing
+every chat model Argo currently offers. Then pick one:
+
+```bash
+omp --model argo/claudeopus5     # routed via /v1/messages
+omp --model argo/gpt56sol        # routed via /v1/chat/completions
+omp models find argo             # list what was written
+```
+
+Unlike `--opencode`, `--pi` starts the shim normally — pi talks to the shim
+rather than to the SSH tunnel, so it inherits token auth, model-name
+normalization, and the `user` field Argo's OpenAI endpoint requires. There is
+no `NODE_TLS_REJECT_UNAUTHORIZED` step because the shim serves plain HTTP on
+localhost.
+
+**What gets written.** Only the span between the marker comments is touched;
+the rest of the file, including your own providers and comments, is preserved
+byte-for-byte:
+
+```yaml
+providers:
+  # BEGIN argo-shim (managed — edits between these markers are overwritten)
+  argo:
+    baseUrl: http://127.0.0.1:<shim-port>/v1
+    apiKey: "<auth-token>"
+    authHeader: true
+    disableStrictTools: true
+    models:
+      - id: "claudeopus5"
+        name: "Claude Opus 5"
+        api: anthropic-messages
+        contextWindow: 200000
+        maxTokens: 32000
+        cost: {input: 0, output: 0, cacheRead: 0, cacheWrite: 0}
+      # ... one entry per Argo chat model
+  # END argo-shim
+```
+
+Re-run `argo-shim --pi` after a port change or `--rotate-token` to re-sync;
+it replaces the managed block in place. Embedding models are omitted (pi is a
+chat client). `contextWindow`/`maxTokens` are conservative per-family
+defaults — raise them per model in your own part of the file if you need to.
+
+Notes:
+
+- `~/.omp/agent/models.yml` is **global**; pi has no project-level model
+  config. `PI_CODING_AGENT_DIR` (or `--profile`) relocates it, and argo-shim
+  honors that variable.
+- `disableStrictTools: true` is required for the Claude models. pi marks its
+  built-in tools `strict`, which reaches Vertex as the `structured_outputs`
+  feature, and Argo's Vertex project has an org policy
+  (`constraints/vertexai.allowedPartnerModelFeatures`) that disallows it for
+  partner Claude models. Drop the line and the first tool call fails with
+  `HTTP 400 ... FAILED_PRECONDITION`.
+- argo-shim refuses to write if the file already has an unmanaged `argo:`
+  provider, or only one of the two markers — rename or remove it and re-run.
+- If Argo's model list can't be fetched, the file is left unchanged rather
+  than written with a guessed catalog.
+
 ## Health Checks
 
 The shim runs these automatically on startup. To run them manually:

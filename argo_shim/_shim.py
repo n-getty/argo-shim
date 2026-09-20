@@ -29,6 +29,14 @@ API_KEY = os.environ.get("CELS_USERNAME", getpass.getuser())
 # Resolution mirrors API_KEY: $ARGO_USER, else $CELS_USERNAME, else login user.
 ARGO_USER = os.environ.get("ARGO_USER") or os.environ.get("CELS_USERNAME") or getpass.getuser()
 OPENCODE_CONFIG = os.path.expanduser("~/.config/opencode/opencode.json")
+# pi (https://omp.sh) reads provider/model definitions from a single global
+# YAML file. PI_CODING_AGENT_DIR relocates the agent dir; honour it so
+# `--profile`/custom-dir users get their config written to the right place.
+PI_CONFIG = os.path.join(
+    os.environ.get("PI_CODING_AGENT_DIR") or os.path.expanduser("~/.omp/agent"),
+    "models.yml")
+PI_BEGIN = "  # BEGIN argo-shim (managed — edits between these markers are overwritten)"
+PI_END = "  # END argo-shim"
 LLM_ROSETTA_CONFIG = os.path.expanduser("~/.config/llm-rosetta-gateway/config.jsonc")
 STATE_PATH = os.path.expanduser("~/.claude/argo-shim-state.json")
 ACCOUNTS_URL = "https://accounts.cels.anl.gov"
@@ -85,6 +93,32 @@ def build_model_alias_map(models):
             # across models (verified against the live model list).
             alias.setdefault(_collapse_model(candidate), target)
     return alias
+
+
+def fetch_argo_models(host, port):
+    """GET /argoapi/v1/models through the tunnel and return the `data` list.
+
+    Shared by the runtime alias map and the pi config writer. Raises on any
+    failure so each caller can decide how to degrade — the alias map falls back
+    to pass-through, while the pi writer refuses to emit a truncated catalog.
+    """
+    conn = None
+    try:
+        context = ssl._create_unverified_context()
+        conn = http.client.HTTPSConnection(host, port, context=context, timeout=10)
+        conn.request("GET", "/argoapi/v1/models",
+                     headers={"Host": REAL_HOST, "x-api-key": API_KEY})
+        resp = conn.getresponse()
+        raw = resp.read()
+        # Treat a non-200 as a fetch failure rather than returning an empty
+        # list: a body that parses but lacks `data` would otherwise silently
+        # look like "Argo has no models" instead of an error.
+        if resp.status != 200:
+            raise RuntimeError(f"HTTP {resp.status} from /argoapi/v1/models: {raw[:200]!r}")
+        return json.loads(raw).get("data", [])
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 SSH_JUMP_HOST = "homes.cels.anl.gov"
@@ -869,21 +903,8 @@ class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
             return self._model_alias
 
     def _fetch_model_alias(self):
-        conn = None
         try:
-            context = ssl._create_unverified_context()
-            conn = http.client.HTTPSConnection(self.target_host, self.target_port,
-                                               context=context, timeout=10)
-            conn.request("GET", "/argoapi/v1/models",
-                         headers={"Host": REAL_HOST, "x-api-key": API_KEY})
-            resp = conn.getresponse()
-            raw = resp.read()
-            # Treat a non-200 as a fetch failure rather than caching an empty
-            # map: a body that parses but lacks `data` would otherwise silently
-            # disable normalization until restart.
-            if resp.status != 200:
-                raise RuntimeError(f"HTTP {resp.status} from /argoapi/v1/models: {raw[:200]!r}")
-            models = json.loads(raw).get("data", [])
+            models = fetch_argo_models(self.target_host, self.target_port)
             alias = build_model_alias_map(models)
             print(f"  Model alias map: {len(alias)} names -> {len(models)} models")
             return alias
@@ -891,9 +912,6 @@ class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
             print(f"  ⚠ Could not fetch model list for name normalization: {e} "
                   f"(forwarding model names unchanged)")
             return {}
-        finally:
-            if conn is not None:
-                conn.close()
 
     def recover_tunnel(self):
         """Attempt to recreate the SSH tunnel. Returns True if recovery succeeded."""
@@ -1458,6 +1476,222 @@ def update_opencode_settings(tunnel_port, tunnel_host="127.0.0.1"):
     return True
 
 
+def _yaml_str(s):
+    """Double-quote a string for YAML. Argo display names contain spaces and
+    dots ("GPT-5.6 Sol"), so nothing may be emitted as a bare scalar."""
+    return '"' + str(s).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+# Per-family limits for the pi model catalog. pi defaults an unspecified model
+# to a 32K window, which would silently truncate long sessions, so we have to
+# state something. These are deliberately conservative: a maxTokens above what
+# the upstream accepts is a hard API error, while a low one only shortens
+# replies. Users can raise them per model in their own part of models.yml.
+PI_MODEL_LIMITS = {
+    "anthropic": (200000, 32000),
+    "google": (1000000, 32000),
+    "openai": (128000, 16384),
+}
+PI_DEFAULT_LIMITS = (128000, 16384)
+
+
+def build_pi_models(models):
+    """Turn Argo's /v1/models `data` into pi model entries, in Argo's own order.
+
+    Each entry carries its own `api`: Claude models route to the shim's
+    Anthropic /messages path (native thinking blocks, which the OpenAI shape
+    would flatten), everything else to /chat/completions. Embedding models are
+    dropped — pi is a chat client and would list them as unusable chat models.
+    """
+    entries = []
+    for m in models:
+        if not isinstance(m, dict):
+            continue
+        model_id = m.get("internal_id") or m.get("id")
+        if not isinstance(model_id, str) or not model_id.strip():
+            continue
+        owner = m.get("owned_by") or ""
+        # Argo exposes embeddings on the same list; they have no chat endpoint.
+        if "embedding" in str(m.get("id", "")).lower() or model_id in ("ada002", "v3small", "v3large"):
+            continue
+        ctx, max_tok = PI_MODEL_LIMITS.get(owner, PI_DEFAULT_LIMITS)
+        entries.append({
+            "id": model_id,
+            "name": m.get("id") or model_id,
+            "api": "anthropic-messages" if owner == "anthropic" else "openai-completions",
+            "contextWindow": ctx,
+            "maxTokens": max_tok,
+        })
+    return entries
+
+
+def render_pi_block(listen_port, auth_token, entries):
+    """Render the managed `argo:` provider block, marker comments included.
+
+    baseUrl serves both wire shapes from one provider: pi appends
+    `/chat/completions` to it for openai-completions, and for anthropic-messages
+    strips the trailing `/v1` before appending `/v1/messages`. Both land on a
+    path the shim rewrites to /argoapi/... .
+    """
+    lines = [PI_BEGIN]
+    lines.append("  argo:")
+    lines.append(f"    baseUrl: http://127.0.0.1:{listen_port}/v1")
+    if auth_token:
+        # A literal value: pi treats apiKey as an env-var NAME first and falls
+        # back to the literal, and a 43-char urlsafe token is never a set var.
+        lines.append(f"    apiKey: {_yaml_str(auth_token)}")
+        # -> Authorization: Bearer <token>, which the shim accepts alongside
+        # x-api-key (what the anthropic-messages path sends on its own).
+        lines.append("    authHeader: true")
+    else:
+        # --no-auth: suppress pi's bogus `Authorization: Bearer N/A`.
+        lines.append("    auth: none")
+    # Load-bearing, and verified by removing it: pi marks its built-in tools
+    # `strict`, which reaches Vertex as the `structured_outputs` feature, and
+    # Argo's Vertex project has an org policy
+    # (constraints/vertexai.allowedPartnerModelFeatures) that rejects it for
+    # partner Claude models. Without this, the first tool call on the Anthropic
+    # path dies with HTTP 400 FAILED_PRECONDITION.
+    lines.append("    disableStrictTools: true")
+    lines.append("    models:")
+    for e in entries:
+        lines.append(f"      - id: {_yaml_str(e['id'])}")
+        lines.append(f"        name: {_yaml_str(e['name'])}")
+        lines.append(f"        api: {e['api']}")
+        lines.append(f"        contextWindow: {e['contextWindow']}")
+        lines.append(f"        maxTokens: {e['maxTokens']}")
+        # Argo bills no per-token cost back to the user; state it explicitly so
+        # pi doesn't show public-catalog prices. All four keys are required.
+        lines.append("        cost: {input: 0, output: 0, cacheRead: 0, cacheWrite: 0}")
+    lines.append(PI_END)
+    return "\n".join(lines) + "\n"
+
+
+def splice_pi_block(existing, block):
+    """Merge the managed block into an existing models.yml by text surgery.
+
+    argo-shim is stdlib-only (no PyYAML), so we never parse the user's YAML —
+    we replace only the span between our markers and leave every other byte,
+    including comments and key order, untouched. Returns (text, note) or
+    raises ValueError if merging would corrupt the file.
+    """
+    if existing is None:
+        return "providers:\n" + block, "created"
+
+    begin = existing.find(PI_BEGIN.strip())
+    end = existing.find(PI_END.strip())
+    if begin != -1 and end != -1 and end > begin:
+        # Expand to whole lines so indentation and the trailing newline survive.
+        start = existing.rfind("\n", 0, begin) + 1
+        stop = existing.find("\n", end)
+        stop = len(existing) if stop == -1 else stop + 1
+        return existing[:start] + block + existing[stop:], "updated"
+    if begin != -1 or end != -1:
+        raise ValueError(
+            "models.yml has only one of the argo-shim BEGIN/END markers. "
+            "Remove the stray marker (and any partial argo: block) and re-run.")
+
+    # No markers yet. Refuse to add a second `argo:` key — YAML duplicate keys
+    # would make pi drop every custom provider, and silently eating the user's
+    # hand-written block would be worse.
+    if re.search(r"^\s+argo:\s*$", existing, re.M):
+        raise ValueError(
+            "models.yml already defines an `argo:` provider that argo-shim "
+            "doesn't manage. Rename or delete it and re-run to let argo-shim "
+            "manage it.")
+
+    m = re.search(r"^providers:[ \t]*$", existing, re.M)
+    if m:
+        insert = existing.find("\n", m.end())
+        insert = len(existing) if insert == -1 else insert + 1
+        return existing[:insert] + block + existing[insert:], "updated"
+
+    if existing.strip():
+        sep = "" if existing.endswith("\n") else "\n"
+        return existing + sep + "providers:\n" + block, "updated"
+    return "providers:\n" + block, "created"
+
+
+def fetch_argo_models_via_shim(listen_port, auth_token):
+    """GET the model list through an already-running shim on localhost.
+
+    Used when argo-shim finds a healthy instance and exits early: there is no
+    tunnel_host/tunnel_port in scope on that path, but the live shim can answer.
+    """
+    conn = None
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", listen_port, timeout=10)
+        headers = {"x-api-key": auth_token} if auth_token else {}
+        conn.request("GET", "/v1/models", headers=headers)
+        resp = conn.getresponse()
+        raw = resp.read()
+        if resp.status != 200:
+            raise RuntimeError(f"HTTP {resp.status} from shim /v1/models: {raw[:200]!r}")
+        return json.loads(raw).get("data", [])
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def update_pi_settings(listen_port, auth_token, tunnel_host=None, tunnel_port=None):
+    """Write the managed argo provider into pi's ~/.omp/agent/models.yml.
+
+    Reads the model catalog straight from the tunnel when one is being set up,
+    or through the running shim when tunnel_host is None.
+    """
+    try:
+        if tunnel_host is None:
+            models = fetch_argo_models_via_shim(listen_port, auth_token)
+        else:
+            models = fetch_argo_models(tunnel_host, tunnel_port)
+    except Exception as e:
+        # Without the live list we'd emit a guessed or empty catalog, and pi
+        # treats an empty `models` as a config error. Leave the file alone.
+        print(f"  ✗ Could not fetch Argo model list for pi config: {e}")
+        print(f"    Left {PI_CONFIG} unchanged.")
+        return False
+
+    entries = build_pi_models(models)
+    if not entries:
+        print(f"  ✗ Argo returned no chat models; left {PI_CONFIG} unchanged.")
+        return False
+
+    block = render_pi_block(listen_port, auth_token, entries)
+    try:
+        with open(PI_CONFIG) as f:
+            existing = f.read()
+    except FileNotFoundError:
+        existing = None
+    except OSError as e:
+        print(f"  ✗ Could not read {PI_CONFIG}: {e}")
+        return False
+
+    try:
+        text, note = splice_pi_block(existing, block)
+    except ValueError as e:
+        print(f"  ✗ {e}")
+        return False
+
+    try:
+        os.makedirs(os.path.dirname(PI_CONFIG), exist_ok=True)
+        # Build the full text first, then replace atomically, so an interrupted
+        # write can't leave the user's other providers truncated.
+        tmp = PI_CONFIG + ".argo-shim.tmp"
+        with open(tmp, "w") as f:
+            f.write(text)
+        os.replace(tmp, PI_CONFIG)
+    except OSError as e:
+        print(f"  ✗ Could not write {PI_CONFIG}: {e}")
+        return False
+
+    anthropic = sum(1 for e in entries if e["api"] == "anthropic-messages")
+    print(f"  ✓ {note} {PI_CONFIG}")
+    print(f"    provider argo -> http://127.0.0.1:{listen_port}/v1 "
+          f"({len(entries)} models: {anthropic} via /messages, "
+          f"{len(entries) - anthropic} via /chat/completions)")
+    return True
+
+
 def _strip_jsonc_comments(text):
     """Strip // and /* */ comments from JSONC text, respecting string literals
     (so "http://..." inside a string value is never mistaken for a comment)."""
@@ -1921,6 +2155,10 @@ def _run():
     parser.add_argument("--opencode", action="store_true",
                         help="Configure opencode to use the SSH tunnel (updates opencode.json) and exit. "
                              "Does not start the shim.")
+    parser.add_argument("--pi", action="store_true",
+                        help="Also configure pi (https://omp.sh) to use the shim: writes a managed "
+                             "`argo` provider into ~/.omp/agent/models.yml. Unlike --opencode this "
+                             "starts the shim normally; pi talks to it, not to the tunnel directly.")
     parser.add_argument("--host", default=None,
                         help="Set the SSH_JUMP_HOST to a different machine (default: homes.cels.anl.gov)")
     parser.add_argument("--nojump", action="store_true",
@@ -1971,6 +2209,18 @@ def _run():
     if args.nojump:
         SSH_PROXY_JUMP = None
         print("Disabling proxy jump")
+
+    # --pi configures a client that talks to the shim, so it needs the shim to
+    # actually start. --opencode and --tunnel both return before that happens.
+    if args.pi:
+        if args.opencode:
+            parser.error("--pi cannot be combined with --opencode (--opencode exits "
+                         "without starting the shim, which pi needs)")
+        if args.tunnel:
+            parser.error("--pi cannot be combined with --tunnel (--tunnel exits "
+                         "without starting the shim, which pi needs)")
+        if args.no_update_settings:
+            parser.error("--pi cannot be combined with --no-update-settings")
 
     if args.opencode:
         incompatible = sum(bool(x) for x in [args.tunnel, args.relay, args.direct])
@@ -2104,6 +2354,9 @@ def _run():
                 existing_token = read_existing_token()
                 update_claude_settings(listen_port, existing_token)
                 update_llm_rosetta_settings(listen_port, existing_token)
+                if args.pi:
+                    # No tunnel in scope on this path — ask the live shim.
+                    update_pi_settings(listen_port, existing_token)
             print(f"  To force a fresh start: argo-shim --restart")
             print(f"  To stop it: kill the argo-shim process (or close its terminal).")
             return
@@ -2242,6 +2495,8 @@ def _run():
         update_claude_settings(listen_port, auth_token)
         print(f"Set ANTHROPIC_BASE_URL=http://127.0.0.1:{listen_port}/argoapi")
         update_llm_rosetta_settings(listen_port, auth_token)
+        if args.pi:
+            update_pi_settings(listen_port, auth_token, tunnel_host, tunnel_port)
 
     _raise_thread_limit()
 
