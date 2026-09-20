@@ -381,8 +381,10 @@ defaults — raise them per model in your own part of the file if you need to.
 Notes:
 
 - `~/.omp/agent/models.yml` is **global**; pi has no project-level model
-  config. `PI_CODING_AGENT_DIR` (or `--profile`) relocates it, and argo-shim
-  honors that variable.
+  config. argo-shim reads `PI_CODING_AGENT_DIR` and writes there instead when
+  it is set. pi's own `--profile` flag is invisible to argo-shim, so if you use
+  it, set `PI_CODING_AGENT_DIR` to the same directory when running
+  `argo-shim --pi`.
 - `disableStrictTools: true` is required for the Claude models. pi marks its
   built-in tools `strict`, which reaches Vertex as the `structured_outputs`
   feature, and Argo's Vertex project has an org policy
@@ -391,6 +393,10 @@ Notes:
   `HTTP 400 ... FAILED_PRECONDITION`.
 - argo-shim refuses to write if the file already has an unmanaged `argo:`
   provider, or only one of the two markers — rename or remove it and re-run.
+- It also refuses if `providers:` isn't a bare key on its own line (a trailing
+  comment, or flow style like `providers: {...}`). Splicing in that case would
+  add a second `providers:` key and YAML would keep only one. Move the comment
+  to its own line and re-run.
 - If Argo's model list can't be fetched, the file is left unchanged rather
   than written with a guessed catalog.
 

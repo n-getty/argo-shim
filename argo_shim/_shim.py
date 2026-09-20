@@ -1512,7 +1512,13 @@ def build_pi_models(models):
             continue
         owner = m.get("owned_by") or ""
         # Argo exposes embeddings on the same list; they have no chat endpoint.
-        if "embedding" in str(m.get("id", "")).lower() or model_id in ("ada002", "v3small", "v3large"):
+        # Check the substring against BOTH the display id and internal_id — an
+        # embedding model whose display name omits the word (the way today's
+        # `v3small`/`ada002` internal ids do) would otherwise reach pi as a
+        # chat model that 404s on first use. The explicit id list stays as the
+        # backstop for exactly those three.
+        haystack = f"{m.get('id', '')} {m.get('internal_id', '')}".lower()
+        if "embedding" in haystack or model_id in ("ada002", "v3small", "v3large"):
             continue
         ctx, max_tok = PI_MODEL_LIMITS.get(owner, PI_DEFAULT_LIMITS)
         entries.append({
@@ -1594,7 +1600,13 @@ def splice_pi_block(existing, block):
     # No markers yet. Refuse to add a second `argo:` key — YAML duplicate keys
     # would make pi drop every custom provider, and silently eating the user's
     # hand-written block would be worse.
-    if re.search(r"^\s+argo:\s*$", existing, re.M):
+    #
+    # Match the key loosely: block style (`  argo:`), flow style
+    # (`  argo: {baseUrl: ...}`), and a quoted key (`  "argo":`) are all the
+    # same key to a YAML parser, so all three must refuse. Indent with
+    # `[ \t]+` rather than `\s+` — `\s` matches newlines, which would make a
+    # top-level `argo:` after a blank line look nested and refuse falsely.
+    if re.search(r"""^[ \t]+(argo|"argo"|'argo')[ \t]*:""", existing, re.M):
         raise ValueError(
             "models.yml already defines an `argo:` provider that argo-shim "
             "doesn't manage. Rename or delete it and re-run to let argo-shim "
@@ -1605,6 +1617,20 @@ def splice_pi_block(existing, block):
         insert = existing.find("\n", m.end())
         insert = len(existing) if insert == -1 else insert + 1
         return existing[:insert] + block + existing[insert:], "updated"
+
+    # There IS a `providers:` key, but not in the bare block form we can splice
+    # into — it has a trailing comment (`providers:  # mine`), or it's flow
+    # style (`providers: {...}`), or it's quoted. Appending our own
+    # `providers:` would create a duplicate top-level key, which is exactly the
+    # corruption this function exists to prevent, and it would be sticky: the
+    # next run finds its markers and updates in place, leaving the duplicate
+    # forever. Refuse and let the user normalize the key.
+    if re.search(r"""^(providers|"providers"|'providers')[ \t]*:""", existing, re.M):
+        raise ValueError(
+            "models.yml has a `providers:` key that argo-shim can't safely "
+            "splice into (it has a trailing comment, or uses flow/quoted "
+            "style). Rewrite it as a bare `providers:` line with the providers "
+            "nested beneath it, and re-run.")
 
     if existing.strip():
         sep = "" if existing.endswith("\n") else "\n"
@@ -1657,12 +1683,18 @@ def update_pi_settings(listen_port, auth_token, tunnel_host=None, tunnel_port=No
         return False
 
     block = render_pi_block(listen_port, auth_token, entries)
+    # Always encoding="utf-8", never the locale default: the marker comments
+    # contain an em-dash, so under a non-UTF-8 locale (LC_ALL=en_US.iso88591)
+    # a bare open() raises UnicodeEncodeError on write and UnicodeDecodeError
+    # on a user file with any non-ASCII comment. Both are ValueError, not
+    # OSError, so they'd escape main()'s handler and take down startup with a
+    # traceback instead of degrading to "left the file unchanged".
     try:
-        with open(PI_CONFIG) as f:
+        with open(PI_CONFIG, encoding="utf-8") as f:
             existing = f.read()
     except FileNotFoundError:
         existing = None
-    except OSError as e:
+    except (OSError, UnicodeDecodeError) as e:
         print(f"  ✗ Could not read {PI_CONFIG}: {e}")
         return False
 
@@ -1672,16 +1704,25 @@ def update_pi_settings(listen_port, auth_token, tunnel_host=None, tunnel_port=No
         print(f"  ✗ {e}")
         return False
 
+    tmp = PI_CONFIG + ".argo-shim.tmp"
     try:
         os.makedirs(os.path.dirname(PI_CONFIG), exist_ok=True)
         # Build the full text first, then replace atomically, so an interrupted
-        # write can't leave the user's other providers truncated.
-        tmp = PI_CONFIG + ".argo-shim.tmp"
-        with open(tmp, "w") as f:
+        # write can't leave the user's other providers truncated. The temp file
+        # holds the auth token, so create it 0600 rather than at the ambient
+        # umask — os.replace preserves the mode, and this config lives on a
+        # shared login node.
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(text)
         os.replace(tmp, PI_CONFIG)
     except OSError as e:
         print(f"  ✗ Could not write {PI_CONFIG}: {e}")
+        # Don't leave a partial temp file holding the token behind.
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
         return False
 
     anthropic = sum(1 for e in entries if e["api"] == "anthropic-messages")
