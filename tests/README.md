@@ -35,6 +35,7 @@ running and no network:
 | `test_401_body_drain.py` | the request body is drained before a 401 reply, and the cases where closing beats draining |
 | `test_key_discovery.py` | non-stock-named SSH keys are found, and the setup guide's smoke test matches `create_tunnel` |
 | `test_pi_config.py` | the `--pi` writer splices `models.yml` without clobbering the user's providers, routes Claude to `anthropic-messages`, refuses rather than guesses (including flow/quoted keys that would duplicate a root), and writes the token-bearing file 0600 as UTF-8 |
+| `test_error_attribution.py` | Argo-side failures are reported as Argo's, not the shim's, and the branch order that keeps it that way |
 
 Put the repo root on `sys.path` so the import comes from the working tree
 rather than an installed copy:
