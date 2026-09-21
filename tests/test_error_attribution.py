@@ -18,11 +18,24 @@ advice for a 503 is "check your inference gateway (127.0.0.1:PORT)", which sends
 the user to debug the tunnel, DNS, and proxy env — all of which are fine. The
 fault is entirely inside Argo. These cases assert we now say so.
 
-The load-bearing case is `ordering`: a requests traceback is full of incidental
-digits (port=443, Errno 111). The generic "401"/"403" substring sniff is a
-coarse test that can fire on those digits, so the upstream-fault check MUST run
-first. If someone reorders the branches in classify_upstream_error, that case
-fails while everything else still passes.
+Branch order in classify_upstream_error is load-bearing in BOTH directions, and
+two cases pin it from opposite sides:
+
+  * `ordering` — the upstream-fault check must run BEFORE the 401/403 sniff.
+    That sniff is a bare substring test, and a requests traceback is full of
+    incidental digits: "port=8403" and "127.0.0.1:8401" both contain the
+    characters it looks for, so an Argo connection failure would be reported
+    as a credentials problem.
+
+  * `specific_wins_over_marker` — the upstream-fault check must run AFTER the
+    429/529/400 branches. Those are more specific than the marker sweep, not
+    less, and Argo's retry loop stacks "Max retries exceeded" on top of a rate
+    limit, so a 429 routinely arrives wearing a marker string. Sweeping it into
+    a generic 502 tells a throttled caller to wait out an Argo outage, and
+    turns a genuine 400 into advice to retry a request that cannot succeed.
+
+Moving the marker branch in either direction fails one of those two while the
+rest of the suite still passes.
 """
 import os
 import sys
@@ -47,6 +60,19 @@ CASES = [
     ("bad request", "Error code: 400 - invalid_request_error", "", 400, False),
     ("credentials", "401 unauthorized", "", 401, True),
     ("unknown", "something inscrutable happened", "", 503, True),
+    # A specific status wrapped in a retry traceback keeps its own status. Argo
+    # emits exactly these shapes: the marker sweep must not swallow them.
+    ("429 under retry noise",
+     "HTTPSConnectionPool(host='apps.inside.anl.gov', port=443): Max retries exceeded "
+     "with url: /argoapi/v1/messages (Caused by ResponseError('too many 429 error responses'))",
+     "", 429, True),
+    ("429 with pool noise",
+     "Error code: 429 - RESOURCE_EXHAUSTED; Max retries exceeded", "", 429, True),
+    ("overloaded under retry noise", "Max retries exceeded", "overloaded_error", 529, True),
+    ("400 under pool noise",
+     "Error code: 400 - invalid_request_error; HTTPSConnectionPool retry log attached",
+     "", 400, False),
+    ("400 by type under retry noise", "Max retries exceeded", "invalid_request_error", 400, False),
 ]
 
 
@@ -67,13 +93,22 @@ def _check(label, err_msg, err_type, want_status, want_attrib):
 
 
 def _check_ordering():
-    """The oauth traceback must not be misread as an auth failure.
+    """An Argo connection failure must not be misread as an auth failure.
 
-    It contains "port=443" and "[Errno 111]" but no literal 401/403 — so this
-    guards the branch order rather than a specific digit collision. We assert
-    the stronger property directly: the upstream-fault branch wins, producing
-    502 and never 401.
+    The marker check has to beat the 401/403 substring sniff. REAL_OAUTH_ERROR
+    happens to contain no literal 401/403, so we also run a traceback whose
+    port number does ("port=8403") — that is the collision the ordering exists
+    to prevent, and asserting it directly keeps this case honest if the sample
+    traceback is ever edited.
     """
+    collision = ("HTTPSConnectionPool(host='apps.inside.anl.gov', port=8403): "
+                 "Max retries exceeded (Caused by NewConnectionError('refused'))")
+    status, _ = shim.classify_upstream_error(collision, "")
+    if status != 502:
+        print("FAIL: ordering: a traceback with 'port=8403' classified as {}.".format(status))
+        print("      The upstream-fault check must run BEFORE the 401/403 sniff.")
+        return False
+
     status, explanation = shim.classify_upstream_error(REAL_OAUTH_ERROR, "")
     if status == 401:
         print("FAIL: ordering: oauth traceback classified as a credentials error.")
@@ -107,25 +142,67 @@ def _check_blames_argo_not_shim():
     return True
 
 
+def _check_specific_wins_over_marker():
+    """The marker sweep must not swallow a status the error already states.
+
+    This is the mirror of `ordering`. Argo's retry loop wraps a rate limit in
+    "Max retries exceeded", so the marker branch, if it ran first, would report
+    a throttled request as a generic Argo outage — telling the caller to wait
+    rather than back off. The 400 case is worse still: a malformed request
+    would be reported as transient and retryable forever.
+    """
+    throttled = ("HTTPSConnectionPool(host='apps.inside.anl.gov', port=443): Max retries "
+                 "exceeded (Caused by ResponseError('too many 429 error responses'))")
+    status, _ = shim.classify_upstream_error(throttled, "")
+    if status != 429:
+        print("FAIL: specific_wins_over_marker: a 429 wrapped in a retry traceback "
+              "classified as {}.".format(status))
+        print("      The 429/529/400 branches must run BEFORE the marker sweep.")
+        return False
+
+    status, _ = shim.classify_upstream_error("Max retries exceeded", "invalid_request_error")
+    if status != 400:
+        print("FAIL: specific_wins_over_marker: an invalid_request_error wrapped in a "
+              "retry traceback classified as {}.".format(status))
+        return False
+
+    print("PASS: specific statuses survive being wrapped in a retry traceback")
+    return True
+
+
 def _check_local_faults_still_blamed_locally():
     """Guard against over-correcting: real shim-side failures must not say 'Argo's fault'.
 
     A tunnel-down message is generated by _send_error, not the classifier, but
     if someone later routes it through here it must not be exonerated. A plain
     local message has none of the upstream markers, so it falls to the generic
-    branch — which is 503 and must NOT claim Argo reached an external provider.
+    branch — which is 503 and must not assert anything it has not established.
+
+    Checking only for the marker branch's exact wording would be too weak: the
+    fall-through could claim "the request failed upstream, not in the shim" and
+    still pass. That sentence is an unwarranted exoneration on the one branch
+    that by definition matched no fingerprint, so assert the absence of the
+    claim, not the absence of one phrasing of it.
     """
-    _, explanation = shim.classify_upstream_error("SSH tunnel is down", "")
-    if explanation and "not a problem with argo-shim" in explanation.lower():
-        print("FAIL: a local tunnel failure was attributed to Argo: {!r}".format(explanation))
-        return False
-    print("PASS: local-sounding failures are not exonerated as Argo outages")
+    for probe in ("SSH tunnel is down", "connection reset by peer", ""):
+        _, explanation = shim.classify_upstream_error(probe, "")
+        low = (explanation or "").lower()
+        if "not a problem with argo-shim" in low:
+            print("FAIL: {!r} was attributed to Argo: {!r}".format(probe, explanation))
+            return False
+        if "not in the shim" in low or "not a shim problem" in low:
+            print("FAIL: {!r} hit the unclassified branch but still cleared the "
+                  "shim: {!r}".format(probe, explanation))
+            print("      The fall-through matched no fingerprint; it cannot know that.")
+            return False
+    print("PASS: unclassified failures are not exonerated as Argo outages")
     return True
 
 
 def main():
     results = [_check(*c) for c in CASES]
     results.append(_check_ordering())
+    results.append(_check_specific_wins_over_marker())
     results.append(_check_blames_argo_not_shim())
     results.append(_check_local_faults_still_blamed_locally())
     print()

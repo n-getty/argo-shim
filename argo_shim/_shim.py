@@ -186,33 +186,48 @@ def classify_upstream_error(err_msg, err_type=""):
     because the client's own advice for a bare 5xx is to check the local
     gateway, which is exactly wrong for a failure that happened inside Argo.
 
-    Ordering matters: the specific upstream-fault check runs before the generic
-    numeric sniffs, because a requests traceback often embeds unrelated digits
-    (ports, errnos) that would otherwise match the 401/403 substring test. For
-    example "port=443 ... [Errno 111]" contains no 401, but a "Connection
-    refused on 127.0.0.1:8403" style message would.
+    Ordering matters, but only against one branch. The 401/403 test is a bare
+    substring sniff, and a requests traceback is full of incidental digits that
+    can contain those three characters — "port=8403" or "127.0.0.1:8401" would
+    both be misread as a credentials failure. So the upstream-fault check runs
+    before it.
+
+    It must NOT run before the 429/529/400 branches, though: those are more
+    specific than the marker sweep, not less. Argo's retry loop emits "Max
+    retries exceeded" on top of a rate limit, so a 429 routinely arrives
+    wearing a marker string. Classifying that as a generic 502 would tell the
+    caller to wait out an Argo outage when the real answer is "you are being
+    throttled" — and would turn a genuine 400 into advice to retry a request
+    that can never succeed.
     """
     text = (err_msg or "").lower()
 
-    if any(marker in text for marker in UPSTREAM_FAULT_MARKERS):
-        provider = "its Vertex AI backend" if "googleapis" in text else "an upstream provider"
-        return 502, (
-            "This is an Argo-side failure, NOT a problem with argo-shim, your SSH "
-            "tunnel, or your machine. Argo could not reach {}. Nothing to fix "
-            "locally; it is usually transient, so retry in a few minutes. If it "
-            "persists, report it to Argo/CELS support.".format(provider))
-
+    # Specific, self-describing failures first: these carry their own status
+    # and stay correct even when wrapped in a retry traceback.
     if "429" in text or "resource_exhausted" in text or "quota exceeded" in text:
         return 429, "Argo rate limit or quota exceeded upstream (not a shim problem)."
     if err_type == "overloaded_error" or "overloaded_error" in text:
         return 529, "The upstream model provider is overloaded (not a shim problem)."
     if err_type == "invalid_request_error" or "invalid_request_error" in text or "error code: 400" in text:
         return 400, None          # genuinely the caller's request; no attribution needed
+
+    if any(marker in text for marker in UPSTREAM_FAULT_MARKERS):
+        provider = "its Vertex AI backend" if "googleapis" in text else "an upstream provider"
+        return 502, (
+            "This is an Argo-side failure, NOT a problem with argo-shim, your SSH "
+            f"tunnel, or your machine. Argo could not reach {provider}. Nothing to fix "
+            "locally; it is usually transient, so retry in a few minutes. If it "
+            "persists, report it to Argo/CELS support.")
+
     if "401" in text or "403" in text or "unauthorized" in text:
         return 401, "Argo rejected the credentials (not a shim problem). Check your CELS access."
 
-    return 503, ("argo-shim reached Argo, but Argo returned an error it did not "
-                 "classify. The request failed upstream, not in the shim.")
+    # Fall-through: no fingerprint matched, so we are guessing. Say only what
+    # we actually know — an error came back from Argo — and do not claim the
+    # shim is in the clear, because nothing here established that.
+    return 503, ("argo-shim received an error from Argo that it could not "
+                 "classify. The upstream message is passed through unchanged "
+                 "below.")
 
 
 # SSH failure classifications. Only these "kinds" count toward the lockout —
@@ -846,7 +861,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                             # will surface, so the user sees whose fault it is
                             # without having to read the shim's console output.
                             message.setdefault("error", {})["message"] = (
-                                "[argo-shim] {}\n\nUpstream error: {}".format(explanation, err_msg))
+                                f"[argo-shim] {explanation}\n\nUpstream error: {err_msg}")
                         error_body = json.dumps(message).encode("utf-8")
                         print(f"[{method}] SSE error (HTTP {http_status}): {err_msg[:200]}")
                         if explanation:
@@ -882,7 +897,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                         upstream_msg, parsed.get("error", {}).get("type", ""))
                     if explanation and upstream_msg:
                         parsed["error"]["message"] = (
-                            "[argo-shim] {}\n\nUpstream error: {}".format(explanation, upstream_msg))
+                            f"[argo-shim] {explanation}\n\nUpstream error: {upstream_msg}")
                         error_body = json.dumps(parsed).encode("utf-8")
                         print(f"[{method}] → {explanation}")
                 except (ValueError, AttributeError, TypeError):
