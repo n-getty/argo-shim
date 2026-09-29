@@ -212,12 +212,20 @@ use it:
   `/chat/completions` request that doesn't already set `user`. The value is
   resolved from `$ARGO_USER`, then `$CELS_USERNAME`, then your login username —
   set `ARGO_USER` if your ALCF username differs.
+- **OpenAI Responses API.** Argo also serves `/argoapi/v1/responses` natively
+  (this is what Codex CLI speaks — see
+  [Using Codex CLI](#using-codex-cli-with-argo-shim) below). Unlike
+  `/chat/completions`, it needs no `user` field, but it does need a different
+  upstream credential; the shim handles this transparently, so clients see no
+  difference in how they authenticate to the shim itself. It's GPT-only —
+  Claude, Gemini, and embedding model names 400 on this path, so route those
+  through `/chat/completions` or `/messages` instead.
 - **Model names.** Argo expects its own model ids (e.g. `gpt4o`, `GPT-4o`), not
   the canonical OpenAI/Anthropic/Gemini spellings, and returns `HTTP 400
-  Invalid model` otherwise. The shim normalizes `/chat/completions` model names
-  to Argo's ids, so canonical names like `gpt-4o`, `gpt-4.1`, `claude-opus-4-8`,
-  or `gemini-2.5-pro` work unchanged. Names it doesn't recognize are forwarded
-  as-is. List the exact ids with:
+  Invalid model` otherwise. The shim normalizes `/chat/completions` and
+  `/responses` model names to Argo's ids, so canonical names like `gpt-4o`,
+  `gpt-4.1`, `claude-opus-4-8`, or `gemini-2.5-pro` work unchanged. Names it
+  doesn't recognize are forwarded as-is. List the exact ids with:
 
   ```bash
   curl -H "Authorization: Bearer ${token}" http://127.0.0.1:<shim-port>/v1/models
@@ -236,88 +244,57 @@ curl http://127.0.0.1:<shim-port>/argoapi/v1/chat/completions \
 
 ## Using Codex CLI with argo-shim
 
-Codex CLI only speaks the OpenAI **Responses API**, but argo-shim (like Argo
-itself) only implements **Chat Completions**. A small translation gateway,
-[`llm-rosetta`](https://github.com/Oaklight/llm-rosetta), bridges the two:
+Codex CLI speaks the OpenAI **Responses API**, and Argo now serves that
+natively at `/argoapi/v1/responses` — so for Argo-backed models, point Codex
+straight at argo-shim; no translation gateway needed:
 
 ```
-Codex --(Responses API)--> llm-rosetta gateway --(Chat Completions)--> argo-shim --> Argo
+Codex --(Responses API)--> argo-shim --> Argo
 ```
 
 **1. Start argo-shim** as usual (see [Quick Start](#quick-start)) and note
 its port from the startup output (`✅ Shim running on <port> -> ...`).
 
-**2. Install and configure llm-rosetta** (requires Python 3.8+; `>=0.7.3`
-to avoid a known upstream bug with null usage fields in Argo's responses):
-
-```bash
-pip install --user 'llm-rosetta>=0.7.3'
-```
-
-`~/.config/llm-rosetta-gateway/config.jsonc`:
-
-```jsonc
-{
-  "providers": {
-    "openai_chat": {
-      "api_key": "placeholder",
-      "base_url": "http://127.0.0.1:<shim-port>/v1"
-    }
-  },
-  "models": {
-    // Argo model ids you want exposed to Codex — see argo-shim's /v1/models
-    "gpt54": "openai_chat",
-    "gpt56sol": "openai_chat"
-  },
-  "server": {
-    "host": "127.0.0.1",
-    "port": 8765,
-    // Required since llm-rosetta 0.7.3, or the gateway 403s every request.
-    "api_key": "<any string — this is what Codex will send back to the gateway>"
-  }
-}
-```
-
-> The `"placeholder"` value is fine — as long as `base_url` points at
-> argo-shim's port, argo-shim keeps that provider's `api_key` in sync with
-> its current auth token automatically on every start/restart, no manual
-> copy-paste needed. The token itself is reused across restarts by default, so
-> this is normally a no-op after the first sync. If you pass `--rotate-token`,
-> restart the gateway afterward too — it reads `config.jsonc` once at its own
-> startup and won't pick up the new token otherwise. This only applies to
-> `providers.*.api_key`; `server.api_key` is a separate, gateway-owned secret
-> you set yourself.
-
-Restart argo-shim once to pick up the new config, then start the gateway:
-
-```bash
-argo-shim --restart
-python3 -m llm_rosetta.gateway
-```
-
-**3. Configure Codex** (`~/.codex/config.toml`) to point at the gateway,
-not at argo-shim directly:
+**2. Configure Codex** (`~/.codex/config.toml`) to point directly at
+argo-shim:
 
 ```toml
-model = "gpt54"
+model = "gpt56sol"
 model_provider = "argo"
 
 [model_providers.argo]
-name = "Argo via llm-rosetta gateway"
-base_url = "http://127.0.0.1:8765/v1"
+name = "Argo"
+base_url = "http://127.0.0.1:<shim-port>/argoapi/v1"
 wire_api = "responses"
-env_key = "ARGO_GATEWAY_KEY"
+env_key = "ARGO_SHIM_TOKEN"
 ```
+
+`<shim-port>` is per-user (derived from a hash of your username), so take it
+from the startup output or `~/.claude/settings.json` rather than copying
+someone else's. `ARGO_SHIM_TOKEN` should hold the shim's own auth token (the
+`$token` value from the authentication note in
+[OpenAI-compatible clients](#openai-compatible-clients) above) — not your
+ALCF/CELS username; the shim's *client*-facing gate checks that token,
+independently of the Bearer credential the shim forwards to Argo on your
+behalf for `/responses`.
 
 ```bash
-export ARGO_GATEWAY_KEY="<the server.api_key value from step 2>"
-codex
+export ARGO_SHIM_TOKEN="${token}"
+codex --model gpt56sol -c model_provider=argo
 ```
 
-> Pointing Codex's `base_url` straight at argo-shim (skipping the gateway)
-> will fail with `error sending request for url (.../responses)` — argo-shim
-> doesn't implement the Responses API, only Chat Completions and Anthropic
-> Messages.
+> `/responses` is GPT-only — Argo 400s Claude/Gemini model names on this path
+> (`"Use a supported GPT model name."`). Codex only ever requests GPT models
+> through this provider, so this isn't a practical limitation, but it does
+> mean `model_providers.argo` here isn't a general Claude/Gemini gateway.
+
+**AskSage-hosted models** (not Argo) still need a translation step, since
+AskSage has no native Responses API endpoint. For those, the
+[`llm-rosetta`](https://github.com/Oaklight/llm-rosetta) gateway remains
+useful: it converts Responses API calls into Chat Completions calls before
+they reach `asksage-proxy`. Point its `openai_chat` provider at argo-shim (or
+at `asksage-proxy` directly) the same way as before; see the `codex-review`
+skill's `references/setup.md` for a worked example.
 
 ## Using pi with argo-shim
 

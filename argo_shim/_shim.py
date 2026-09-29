@@ -27,6 +27,12 @@ API_KEY = os.environ.get("CELS_USERNAME", getpass.getuser())
 # returns HTTP 500. The Anthropic /messages path does NOT need this. We
 # auto-inject it so OpenAI-format clients work without having to know about it.
 # Resolution mirrors API_KEY: $ARGO_USER, else $CELS_USERNAME, else login user.
+#
+# /responses (OpenAI's Responses API, what Codex CLI actually speaks) is
+# different again: it rejects x-api-key and instead wants the username as an
+# `Authorization: Bearer` token, but needs no `user` body field. It's also
+# GPT-only — Argo 400s Claude/Gemini/embedding model names on this path — so
+# it isn't a general replacement for /chat/completions.
 ARGO_USER = os.environ.get("ARGO_USER") or os.environ.get("CELS_USERNAME") or getpass.getuser()
 OPENCODE_CONFIG = os.path.expanduser("~/.config/opencode/opencode.json")
 # pi (https://omp.sh) reads provider/model definitions from a single global
@@ -713,6 +719,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
         print(f"[{method}] Intercepted Request: {self.path}")
 
+        is_responses = "/responses" in self.path
+
         # Force stream=true on /messages requests to avoid Vertex AI 500 errors.
         # Vertex rejects non-streaming requests it estimates will exceed 10 minutes.
         # When we force streaming, we reassemble the SSE response back into a
@@ -751,31 +759,34 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             except (json.JSONDecodeError, UnicodeDecodeError):
                 print(f"[{method}] /messages: could not parse body, forwarding as-is")
 
-        # Fix up OpenAI/Gemini chat-completions requests. Argo requires:
-        #   1. a `user` field set to a valid ALCF username (else HTTP 500), and
-        #   2. an exact model id — canonical names like `gpt-4o` return HTTP 400;
-        #      Argo wants `gpt4o` / `GPT-4o`.
-        # We auto-inject the user and normalize the model name so OpenAI-format
-        # clients work unmodified. Only applies to /chat/completions (not
-        # /messages, which Claude Code uses).
-        if method == "POST" and body and "/chat/completions" in self.path:
+        # Fix up OpenAI/Gemini chat-completions and Responses-API requests. Argo
+        # requires an exact model id on both — canonical names like `gpt-4o`
+        # return HTTP 400; Argo wants `gpt4o` / `GPT-4o`. /chat/completions also
+        # needs a `user` field set to a valid ALCF username (else HTTP 500);
+        # /responses doesn't take one. Only applies to /chat/completions and
+        # /responses (create), not /messages (Claude Code) or a /responses/<id>
+        # sub-resource lookup.
+        if method == "POST" and body and ("/chat/completions" in self.path
+                                           or (is_responses and "/responses/" not in self.path)):
+            label = "/responses" if is_responses else "/chat/completions"
             try:
                 req_json = json.loads(body)
                 # Only mutate object bodies; valid non-object JSON (e.g. an array)
                 # is forwarded untouched rather than crashing the handler.
                 if not isinstance(req_json, dict):
-                    print(f"[{method}] /chat/completions: body is not a JSON object, forwarding as-is")
+                    print(f"[{method}] {label}: body is not a JSON object, forwarding as-is")
                 else:
                     body_changed = False
 
-                    existing = req_json.get("user")
-                    # Treat blank/whitespace user as missing — Argo rejects it.
-                    if not (isinstance(existing, str) and existing.strip()):
-                        req_json["user"] = ARGO_USER
-                        body_changed = True
-                        print(f"[{method}] /chat/completions: injected user={ARGO_USER} (model={req_json.get('model', '<not set>')})")
-                    else:
-                        print(f"[{method}] /chat/completions: user already set ({existing})")
+                    if not is_responses:
+                        existing = req_json.get("user")
+                        # Treat blank/whitespace user as missing — Argo rejects it.
+                        if not (isinstance(existing, str) and existing.strip()):
+                            req_json["user"] = ARGO_USER
+                            body_changed = True
+                            print(f"[{method}] {label}: injected user={ARGO_USER} (model={req_json.get('model', '<not set>')})")
+                        else:
+                            print(f"[{method}] {label}: user already set ({existing})")
 
                     # Normalize the model name to the exact id Argo expects.
                     orig_model = req_json.get("model")
@@ -784,12 +795,12 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                         if resolved != orig_model:
                             req_json["model"] = resolved
                             body_changed = True
-                            print(f"[{method}] /chat/completions: normalized model {orig_model!r} -> {resolved!r}")
+                            print(f"[{method}] {label}: normalized model {orig_model!r} -> {resolved!r}")
 
                     if body_changed:
                         body = json.dumps(req_json).encode("utf-8")
             except (json.JSONDecodeError, UnicodeDecodeError):
-                print(f"[{method}] /chat/completions: could not parse body, forwarding as-is")
+                print(f"[{method}] {label}: could not parse body, forwarding as-is")
 
         # Path rewrite logic
         path = self.path
@@ -806,6 +817,12 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         headers = {k: v for k, v in self.headers.items() if k.lower() not in _strip}
         headers['Host'] = REAL_HOST
         headers['x-api-key'] = API_KEY
+        if is_responses:
+            # Argo's /responses rejects x-api-key and wants the username as a
+            # Bearer token instead. Sending both is accepted upstream, so this is
+            # additive. 'authorization' is already in _strip, so the client's own
+            # shim token is gone by here — this only ever forwards our API_KEY.
+            headers['Authorization'] = f'Bearer {API_KEY}'
         headers['Connection'] = 'close'
 
         for attempt in range(2):
