@@ -252,41 +252,61 @@ straight at argo-shim; no translation gateway needed:
 Codex --(Responses API)--> argo-shim --> Argo
 ```
 
-**1. Start argo-shim** as usual (see [Quick Start](#quick-start)) and note
-its port from the startup output (`✅ Shim running on <port> -> ...`).
-
-**2. Configure Codex** (`~/.codex/config.toml`) to point directly at
-argo-shim:
-
-```toml
-model = "gpt56sol"
-model_provider = "argo"
-
-[model_providers.argo]
-name = "Argo"
-base_url = "http://127.0.0.1:<shim-port>/argoapi/v1"
-wire_api = "responses"
-env_key = "ARGO_SHIM_TOKEN"
-```
-
-`<shim-port>` is per-user (derived from a hash of your username), so take it
-from the startup output or `~/.claude/settings.json` rather than copying
-someone else's. `ARGO_SHIM_TOKEN` should hold the shim's own auth token (the
-`$token` value from the authentication note in
-[OpenAI-compatible clients](#openai-compatible-clients) above) — not your
-ALCF/CELS username; the shim's *client*-facing gate checks that token,
-independently of the Bearer credential the shim forwards to Argo on your
-behalf for `/responses`.
+**Start the shim with `--codex`:**
 
 ```bash
-export ARGO_SHIM_TOKEN="${token}"
-codex --model gpt56sol -c model_provider=argo
+argo-shim --codex
 ```
+
+That writes a managed `argo` model provider into `~/.codex/config.toml` and a
+matching profile into `~/.codex/argo.config.toml` (a separate file — Codex's
+`--profile` mechanism loads `$CODEX_HOME/<name>.config.toml`, and current
+Codex refuses to start if a profile is defined as a `[profiles.<name>]` table
+inside `config.toml` instead). Then run:
+
+```bash
+codex --profile argo
+```
+
+No `ARGO_SHIM_TOKEN` export, no manual TOML editing. The shim embeds its own
+auth token directly into `config.toml` as `experimental_bearer_token`, the
+same way it writes `apiKeyHelper` for Claude Code — nothing for you to keep
+in sync in your shell environment. To use a different Argo model than the
+default (`gpt56sol`), override at launch: `codex --profile argo --model
+gpt56luna`, or edit `argo.config.toml`'s `model =` line (note: only that file
+is safe to hand-edit; anything inside the `# BEGIN/END argo-shim` markers in
+`config.toml` is overwritten on the next `--codex` run).
 
 > `/responses` is GPT-only — Argo 400s Claude/Gemini model names on this path
 > (`"Use a supported GPT model name."`). Codex only ever requests GPT models
 > through this provider, so this isn't a practical limitation, but it does
-> mean `model_providers.argo` here isn't a general Claude/Gemini gateway.
+> mean the `argo` provider here isn't a general Claude/Gemini gateway.
+
+**Manual setup**, if you'd rather not run `--codex` (or want to see exactly
+what it writes) — this is also what `--codex` does for you automatically:
+
+```toml
+[model_providers.argo]
+name = "Argo"
+base_url = "http://127.0.0.1:<shim-port>/argoapi/v1"
+wire_api = "responses"
+experimental_bearer_token = "<shim's auth token>"
+```
+
+in `~/.codex/config.toml`, plus a `~/.codex/argo.config.toml` containing:
+
+```toml
+model_provider = "argo"
+model = "gpt56sol"
+```
+
+`<shim-port>` is per-user (derived from a hash of your username), so take it
+from the startup output or `~/.claude/settings.json` rather than copying
+someone else's. If you'd rather not have the shim's token sitting in
+plaintext in `config.toml`, `env_key = "ARGO_SHIM_TOKEN"` (plus exporting that
+variable yourself) is a valid alternative to `experimental_bearer_token` —
+the same trade-off `--pi`'s `models.yml` output already makes for its own
+`apiKey`.
 
 **AskSage-hosted models** (not Argo) still need a translation step, since
 AskSage has no native Responses API endpoint. For those, the

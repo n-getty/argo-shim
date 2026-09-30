@@ -43,6 +43,13 @@ PI_CONFIG = os.path.join(
     "models.yml")
 PI_BEGIN = "  # BEGIN argo-shim (managed — edits between these markers are overwritten)"
 PI_END = "  # END argo-shim"
+# Codex CLI reads a single global TOML file. CODEX_HOME relocates it, exactly
+# like PI_CODING_AGENT_DIR does for pi above.
+CODEX_CONFIG = os.path.join(
+    os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex"),
+    "config.toml")
+CODEX_BEGIN = "# BEGIN argo-shim (managed — edits between these markers are overwritten)"
+CODEX_END = "# END argo-shim"
 LLM_ROSETTA_CONFIG = os.path.expanduser("~/.config/llm-rosetta-gateway/config.jsonc")
 STATE_PATH = os.path.expanduser("~/.claude/argo-shim-state.json")
 ACCOUNTS_URL = "https://accounts.cels.anl.gov"
@@ -1843,6 +1850,217 @@ def update_pi_settings(listen_port, auth_token, tunnel_host=None, tunnel_port=No
     return True
 
 
+def _toml_str(s):
+    """Double-quote a string for TOML (only \\ and " need escaping here — no
+    multi-line or literal-string values are ever emitted by this writer)."""
+    return '"' + str(s).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+# Argo's recommended default for Codex — see SKILL.md/model-catalog.md in the
+# codex-review skill. Editing this inside the managed block is overwritten on
+# the next `--codex` run; override per-launch with `--model` or `-c model=...`
+# instead.
+CODEX_DEFAULT_MODEL = "gpt56sol"
+
+
+# `codex --profile <name>` layers `$CODEX_HOME/<name>.config.toml` on top of
+# the base config.toml (Codex >= ~0.15x). An older `[profiles.<name>]` table
+# INSIDE config.toml did the same thing on earlier Codex releases, but current
+# Codex refuses to start at all if it finds one ("legacy `profile = ...` or
+# `[profiles.<name>]` config" error) — so the profile must be its own file,
+# never a table in CODEX_CONFIG. Verified live against a real Codex install.
+CODEX_PROFILE_CONFIG = os.path.join(os.path.dirname(CODEX_CONFIG), "argo.config.toml")
+
+
+def render_codex_provider_block(listen_port, auth_token):
+    """Render the managed `[model_providers.argo]` span for config.toml,
+    marker comments included.
+
+    Embeds the token as `experimental_bearer_token` (a literal string) rather
+    than the more common `env_key` (an environment variable NAME Codex reads
+    at its own launch) — env_key would require also getting a value into the
+    user's shell environment, which a running process can't do for an
+    already-open shell without editing a shell rc file, a much bigger blast
+    radius than this writer's other targets. experimental_bearer_token avoids
+    that entirely, at the cost of the token sitting in plaintext in
+    config.toml — the same trade-off pi's models.yml already makes for its
+    apiKey. Verified live: env_key present (even as "") on the same table
+    takes priority over experimental_bearer_token, so the two must never be
+    emitted together.
+    """
+    lines = [CODEX_BEGIN]
+    lines.append("[model_providers.argo]")
+    lines.append("name = " + _toml_str("Argo"))
+    lines.append("base_url = " + _toml_str(f"http://127.0.0.1:{listen_port}/argoapi/v1"))
+    lines.append('wire_api = "responses"')
+    if auth_token:
+        lines.append("experimental_bearer_token = " + _toml_str(auth_token))
+    # else: --no-auth. Omit the field entirely rather than writing an empty
+    # string — Codex would still send an (empty) Authorization header, and
+    # the shim's own listener already accepts unauthenticated requests.
+    lines.append(CODEX_END)
+    return "\n".join(lines) + "\n"
+
+
+def render_codex_profile_file():
+    """Render the full contents of the managed argo.config.toml profile file.
+
+    This file is entirely argo-shim's — Codex loads it only when the user
+    passes --profile argo, so unlike config.toml there's no reason to expect
+    hand-written content sharing the file, and no marker comments are needed.
+    """
+    lines = ['model_provider = "argo"']
+    lines.append("model = " + _toml_str(CODEX_DEFAULT_MODEL))
+    return "\n".join(lines) + "\n"
+
+
+# Matches a `[model_providers.argo]` table header in any TOML-legal spelling:
+# bare, quoted, or double-quoted key, with or without surrounding whitespace
+# inside the brackets. Used only to detect an unmanaged conflict before
+# splicing — TOML, unlike YAML, hard-errors on a duplicate table header when
+# Codex parses it, so writing a second one would break the user's file
+# outright rather than just silently dropping data. Also flags a leftover
+# `[profiles.argo]` table specifically, since current Codex refuses to start
+# at all if it finds one (deprecated in favor of the separate
+# argo.config.toml file this writer now manages) — a user who set that up by
+# hand (as recommended by an earlier version of this project's own docs) has
+# a config that's already broken, and the fix is to delete that table, not to
+# splice around it.
+_CODEX_PROVIDER_TABLE_RE = re.compile(
+    r"""^\[\s*(?:model_providers|"model_providers"|'model_providers')"""
+    r"""\s*\.\s*(?:argo|"argo"|'argo')\s*\]""",
+    re.M)
+_CODEX_LEGACY_PROFILE_RE = re.compile(
+    r"""^\[\s*(?:profiles|"profiles"|'profiles')\s*\.\s*(?:argo|"argo"|'argo')\s*\]""",
+    re.M)
+# Inline-table form (`model_providers = { argo = {...} }`) can't be safely
+# spliced into either — there is no line to insert a table header after
+# without duplicating a root key.
+_CODEX_INLINE_RE = re.compile(
+    r"""^(?:model_providers|"model_providers"|'model_providers')\s*=\s*\{""",
+    re.M)
+
+
+def splice_codex_block(existing, block):
+    """Merge the managed [model_providers.argo] block into an existing
+    config.toml by text surgery.
+
+    argo-shim is stdlib-only (no TOML writer in Python < 3.11's tomllib,
+    which is read-only anyway), so we never parse the user's TOML — we
+    replace only the span between our markers and leave every other byte
+    untouched. Returns (text, note) or raises ValueError if merging would
+    corrupt the file.
+    """
+    if existing is None:
+        return block, "created"
+
+    begin = existing.find(CODEX_BEGIN)
+    end = existing.find(CODEX_END)
+    if begin != -1 and end != -1 and end > begin:
+        start = existing.rfind("\n", 0, begin) + 1
+        stop = existing.find("\n", end)
+        stop = len(existing) if stop == -1 else stop + 1
+        return existing[:start] + block + existing[stop:], "updated"
+    if begin != -1 or end != -1:
+        raise ValueError(
+            "config.toml has only one of the argo-shim BEGIN/END markers. "
+            "Remove the stray marker (and any partial argo block) and re-run.")
+
+    # A leftover [profiles.argo] table breaks Codex startup outright on
+    # current versions, independent of anything this writer does — call it
+    # out specifically rather than lumping it in with the generic conflict
+    # message below, since the fix (delete the table) is the same but the
+    # "why" is different and worth explaining.
+    m = _CODEX_LEGACY_PROFILE_RE.search(existing)
+    if m:
+        raise ValueError(
+            f"config.toml has a {m.group(0)} table, which current Codex "
+            "refuses to start with at all (profiles moved to a separate "
+            f"{os.path.basename(CODEX_PROFILE_CONFIG)} file). Delete that "
+            "table and re-run — argo-shim manages the profile in its own "
+            "file now.")
+
+    # No markers yet. Refuse to add a second [model_providers.argo] table —
+    # TOML parsers reject duplicate table headers outright, so appending ours
+    # on top of a hand-written one wouldn't silently corrupt the file, it
+    # would make Codex refuse to start at all.
+    m = _CODEX_PROVIDER_TABLE_RE.search(existing)
+    if m:
+        raise ValueError(
+            f"config.toml already has an unmanaged {m.group(0)} table that "
+            "argo-shim doesn't manage. Remove it (and its contents) and "
+            "re-run to let argo-shim manage it.")
+    m = _CODEX_INLINE_RE.search(existing)
+    if m:
+        raise ValueError(
+            "config.toml defines model_providers as an inline table "
+            "({ ... }), which argo-shim can't safely splice a new sub-table "
+            "into. Rewrite it as [model_providers.<name>] table headers and "
+            "re-run.")
+
+    if not existing.strip():
+        return block, "created"
+    sep = "\n" if existing.endswith("\n") else "\n\n"
+    return existing + sep + block, "updated"
+
+
+def _write_atomic_0600(path, text):
+    """Write text to path atomically, 0600 from creation. Shared by the
+    config.toml splice and the argo.config.toml full-file write below, since
+    both may hold a plaintext bearer token on a shared login node."""
+    tmp = path + ".argo-shim.tmp"
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except OSError as e:
+        print(f"  ✗ Could not write {path}: {e}")
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return False
+    return True
+
+
+def update_codex_settings(listen_port, auth_token):
+    """Write the managed argo provider into config.toml and the argo profile
+    into its own argo.config.toml (see CODEX_PROFILE_CONFIG for why the
+    profile can't live inside config.toml on current Codex).
+    """
+    block = render_codex_provider_block(listen_port, auth_token)
+    try:
+        with open(CODEX_CONFIG, encoding="utf-8") as f:
+            existing = f.read()
+    except FileNotFoundError:
+        existing = None
+    except (OSError, UnicodeDecodeError) as e:
+        print(f"  ✗ Could not read {CODEX_CONFIG}: {e}")
+        return False
+
+    try:
+        text, note = splice_codex_block(existing, block)
+    except ValueError as e:
+        print(f"  ✗ {e}")
+        return False
+
+    # Atomic 0600 writes for both files: config.toml may now hold a plaintext
+    # bearer token, and argo.config.toml always does (when auth is enabled).
+    if not _write_atomic_0600(CODEX_CONFIG, text):
+        return False
+    if not _write_atomic_0600(CODEX_PROFILE_CONFIG, render_codex_profile_file()):
+        return False
+
+    print(f"  ✓ {note} {CODEX_CONFIG}")
+    print(f"  ✓ wrote {CODEX_PROFILE_CONFIG}")
+    print(f"    provider argo -> http://127.0.0.1:{listen_port}/argoapi/v1 "
+          f"(profile 'argo', default model {CODEX_DEFAULT_MODEL!r})")
+    print(f"    Run:  codex --profile argo")
+    return True
+
+
 def _strip_jsonc_comments(text):
     """Strip // and /* */ comments from JSONC text, respecting string literals
     (so "http://..." inside a string value is never mistaken for a comment)."""
@@ -2310,6 +2528,11 @@ def _run():
                         help="Also configure pi (https://omp.sh) to use the shim: writes a managed "
                              "`argo` provider into ~/.omp/agent/models.yml. Unlike --opencode this "
                              "starts the shim normally; pi talks to it, not to the tunnel directly.")
+    parser.add_argument("--codex", action="store_true",
+                        help="Also configure Codex CLI to use the shim: writes a managed `argo` "
+                             "model provider and profile into ~/.codex/config.toml. Unlike --opencode "
+                             "this starts the shim normally; Codex talks to it, not to the tunnel "
+                             "directly.")
     parser.add_argument("--host", default=None,
                         help="Set the SSH_JUMP_HOST to a different machine (default: homes.cels.anl.gov)")
     parser.add_argument("--nojump", action="store_true",
@@ -2361,8 +2584,10 @@ def _run():
         SSH_PROXY_JUMP = None
         print("Disabling proxy jump")
 
-    # --pi configures a client that talks to the shim, so it needs the shim to
-    # actually start. --opencode and --tunnel both return before that happens.
+    # --pi and --codex both configure a client that talks to the shim, so they
+    # need the shim to actually start. --opencode and --tunnel both return
+    # before that happens. --pi and --codex are not mutually exclusive with
+    # each other — configuring both in one run is fine.
     if args.pi:
         if args.opencode:
             parser.error("--pi cannot be combined with --opencode (--opencode exits "
@@ -2372,6 +2597,16 @@ def _run():
                          "without starting the shim, which pi needs)")
         if args.no_update_settings:
             parser.error("--pi cannot be combined with --no-update-settings")
+
+    if args.codex:
+        if args.opencode:
+            parser.error("--codex cannot be combined with --opencode (--opencode exits "
+                         "without starting the shim, which Codex needs)")
+        if args.tunnel:
+            parser.error("--codex cannot be combined with --tunnel (--tunnel exits "
+                         "without starting the shim, which Codex needs)")
+        if args.no_update_settings:
+            parser.error("--codex cannot be combined with --no-update-settings")
 
     if args.opencode:
         incompatible = sum(bool(x) for x in [args.tunnel, args.relay, args.direct])
@@ -2508,6 +2743,8 @@ def _run():
                 if args.pi:
                     # No tunnel in scope on this path — ask the live shim.
                     update_pi_settings(listen_port, existing_token)
+                if args.codex:
+                    update_codex_settings(listen_port, existing_token)
             print(f"  To force a fresh start: argo-shim --restart")
             print(f"  To stop it: kill the argo-shim process (or close its terminal).")
             return
@@ -2648,6 +2885,8 @@ def _run():
         update_llm_rosetta_settings(listen_port, auth_token)
         if args.pi:
             update_pi_settings(listen_port, auth_token, tunnel_host, tunnel_port)
+        if args.codex:
+            update_codex_settings(listen_port, auth_token)
 
     _raise_thread_limit()
 

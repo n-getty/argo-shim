@@ -37,6 +37,7 @@ running and no network:
 | `test_pi_config.py` | the `--pi` writer splices `models.yml` without clobbering the user's providers, routes Claude to `anthropic-messages`, refuses rather than guesses (including flow/quoted keys that would duplicate a root), and writes the token-bearing file 0600 as UTF-8 |
 | `test_error_attribution.py` | Argo-side failures are reported as Argo's, not the shim's, and the branch order that keeps it that way |
 | `test_responses_endpoint.py` | `/responses` gets an `Authorization: Bearer <API_KEY>` header (client tokens never forwarded), model normalization, and no stray `user` field, without regressing `/chat/completions` or `/messages` |
+| `test_codex_config.py` | the `--codex` writer splices `config.toml` without clobbering the user's config, refuses rather than guesses (including a leftover `[profiles.argo]` table current Codex won't start with), embeds the auth token literally instead of via an env var, and writes both files 0600 as UTF-8 |
 
 Put the repo root on `sys.path` so the import comes from the working tree
 rather than an installed copy:
