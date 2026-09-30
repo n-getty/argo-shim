@@ -277,6 +277,21 @@ gpt56luna`, or edit `argo.config.toml`'s `model =` line (note: only that file
 is safe to hand-edit; anything inside the `# BEGIN/END argo-shim` markers in
 `config.toml` is overwritten on the next `--codex` run).
 
+> **If you already have a `[model_providers.argo]` table in `config.toml`**
+> (e.g. from an older manual setup, or a project's llm-rosetta-gateway
+> instructions), `--codex` refuses to touch it rather than guessing — you'll
+> see `✗ config.toml already has an unmanaged [model_providers.argo] table
+> that argo-shim doesn't manage`, printed alongside (not instead of) the
+> shim's normal startup output, so it's easy to miss if you're not looking
+> for it. **Delete that entire table by hand** (and drop or repoint any
+> top-level `model_provider = "argo"` / `model = "..."` lines that referred
+> to it), then re-run `argo-shim --codex` to let it write the correct one.
+> Leaving the stale table in place means Codex keeps using whatever that old
+> config pointed at (a dead gateway port, wrong credential, etc.) even though
+> `--codex` "succeeded" and the shim itself is healthy — the refusal is
+> silent-looking, not a hard failure, so nothing else warns you this
+> happened.
+
 > `/responses` is GPT-only — Argo 400s Claude/Gemini model names on this path
 > (`"Use a supported GPT model name."`). Codex only ever requests GPT models
 > through this provider, so this isn't a practical limitation, but it does
