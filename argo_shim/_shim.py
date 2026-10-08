@@ -1365,7 +1365,7 @@ def stop_own_shim(listen_port, host="127.0.0.1"):
     return False
 
 
-def _spawn_ssh(cmd, what):
+def _spawn_ssh(cmd, what, timeout=30):
     """Run a forking ssh command (`ssh -N -f ...`), capturing stderr to a file.
 
     `ssh -f` authenticates in the foreground (including the interactive Duo
@@ -1381,13 +1381,35 @@ def _spawn_ssh(cmd, what):
     connection diagnostics (written by the parent before it forks) are still on
     disk for us to classify.
 
-    On failure: print the captured stderr (so the user still sees it), classify
-    the error, record it against the persistent lockout (only auth-type kinds
-    count), and raise SSHAuthError with an actionable hint. Returns nothing on
-    success.
+    `timeout` bounds the whole call. All call sites pass BatchMode=yes, so this
+    is never waiting on a human at a Duo prompt — it exists for a different
+    failure: when ControlMaster=auto hands the forward request to an existing
+    multiplexed master, the new ssh client blocks synchronously on that
+    master's reply, and OpenSSH puts no timeout of its own on that handshake.
+    A master that is alive enough to hold its control socket open but can no
+    longer service requests (e.g. its underlying session to a NAT/firewall was
+    silently dropped) hangs the new client — and therefore create_tunnel, and
+    therefore recover_tunnel's lock — forever. On timeout we kill the hung
+    client, close that control master so the next attempt opens a fresh
+    session instead of hanging the same way again, and raise plain
+    RuntimeError: a wedged master is not a credential failure and must not
+    count toward the SSH auth lockout.
+
+    On a normal failure: print the captured stderr (so the user still sees
+    it), classify the error, record it against the persistent lockout (only
+    auth-type kinds count), and raise SSHAuthError with an actionable hint.
+    Returns nothing on success.
     """
     with tempfile.TemporaryFile(mode="w+") as errfile:
-        result = subprocess.run(cmd, stderr=errfile)
+        try:
+            result = subprocess.run(cmd, stderr=errfile, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _close_control_master()
+            raise RuntimeError(
+                f"{what} timed out after {timeout}s waiting for ssh to respond "
+                f"(likely a wedged ControlMaster); closed it so the next attempt "
+                f"starts a fresh session."
+            )
         errfile.seek(0)
         stderr = errfile.read().strip()
     if result.returncode == 0:
@@ -1411,6 +1433,7 @@ def create_tunnel(port, host="127.0.0.1", bind_address="127.0.0.1"):
         *_ssh_verbose_flags(),
         "-o", "BatchMode=yes",
         "-o", "ConnectionAttempts=1",
+        "-o", "ExitOnForwardFailure=yes",
         "-o", "ServerAliveInterval=15",
         "-o", "ServerAliveCountMax=4",
         "-o", "ControlMaster=auto",
@@ -1437,6 +1460,12 @@ def create_tunnel(port, host="127.0.0.1", bind_address="127.0.0.1"):
             except (ConnectionRefusedError, OSError):
                 time.sleep(0.5)
     else:
+        # ExitOnForwardFailure should turn a dead forward into a nonzero exit
+        # (handled by _spawn_ssh above) before we ever get here, but a wedged
+        # ControlMaster can still accept the forward request and never bring
+        # it up. Close it so the next recovery attempt gets a fresh session
+        # instead of looping against the same stuck master forever.
+        _close_control_master()
         raise RuntimeError(f"SSH tunnel on port {port} never started accepting connections")
 
     print(f"Verifying new tunnel...")
