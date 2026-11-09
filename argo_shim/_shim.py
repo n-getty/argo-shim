@@ -21,6 +21,7 @@ import time
 TARGET_HOST = "127.0.0.1"
 REAL_HOST = "apps.inside.anl.gov"
 API_KEY = os.environ.get("CELS_USERNAME", getpass.getuser())
+LOCAL_USER = getpass.getuser()  # local login user (for ps ownership checks)
 
 # Argo's OpenAI-compatible /chat/completions endpoint (used for OpenAI and
 # Gemini models) requires a `user` field set to a valid ALCF username, or it
@@ -1121,7 +1122,7 @@ def _kill_stale_tunnel(port, bind_address="127.0.0.1"):
             )
             output = ps.stdout.strip()
             fields = output.split(None, 2)  # user, comm, args
-            if len(fields) >= 3 and fields[0] == API_KEY and "ssh" in fields[1] \
+            if len(fields) >= 3 and fields[0] == LOCAL_USER and "ssh" in fields[1] \
                     and f"{REAL_HOST}:443" in fields[2]:
                 print(f"  Killing stale SSH tunnel (PID {pid})...")
                 os.kill(int(pid), signal.SIGTERM)
@@ -1206,9 +1207,9 @@ def is_own_process(port):
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=5
             )
             owner = stat.stdout.strip()
-            if owner == API_KEY:
+            if owner == LOCAL_USER:
                 return True
-            print(f"  Skipping port {port} (owned by {owner}, not {API_KEY})")
+            print(f"  Skipping port {port} (owned by {owner}, not {LOCAL_USER})")
             return False
     except Exception:
         pass
@@ -1254,7 +1255,7 @@ def find_own_listener_pid(port):
                 ["ps", "-o", "user=", "-p", pid],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=5
             )
-            if stat.stdout.strip() == API_KEY:
+            if stat.stdout.strip() == LOCAL_USER:
                 return int(pid)
             return None
     except Exception:
