@@ -268,6 +268,68 @@ def _check_timeout_not_retried():
     return results
 
 
+def _check_tunnel_survives_ctrl_c():
+    """The tunnel's ssh tree must survive a terminal SIGINT/SIGHUP.
+
+    Stand-in for ssh + its -J `ssh -W` child: a python parent that spawns a
+    `sleep` grandchild, all in one process group (like the terminal's
+    foreground group). Sending SIGINT to the group mimics Ctrl-C. A bare
+    command is the control: it must die, proving the signal really landed.
+    """
+    import signal
+    import subprocess
+    import time
+    tree = [sys.executable, "-c",
+            "import subprocess; subprocess.run(['sleep', '5'])"]
+    results = []
+    for label, cmd, want_alive in (
+            ("unwrapped (control)", tree, False),
+            ("wrapped", shim._ignoring_terminal_signals(tree), True)):
+        for sig in (signal.SIGINT, signal.SIGHUP):
+            p = subprocess.Popen(cmd, start_new_session=True)
+            try:
+                time.sleep(0.5)
+                os.killpg(p.pid, sig)
+                time.sleep(0.5)
+                alive = p.poll() is None
+            finally:
+                try:
+                    os.killpg(p.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                p.wait()
+            results.append(check(
+                "{}: ssh tree {} {}".format(
+                    label, "survives" if want_alive else "is killed by", sig.name),
+                alive, want_alive))
+
+    seen = []
+    real = shim._spawn_ssh, shim.check_port_available, shim._control_master_state
+    real_sleep, real_allowed = shim.time.sleep, shim._ssh_tracker.check_allowed
+    shim._spawn_ssh = lambda cmd, what, timeout=None: seen.append(cmd)
+    shim.check_port_available = lambda port, bind_address="127.0.0.1": None
+    shim._control_master_state = lambda: "absent"
+    shim.time.sleep = lambda s: None
+    shim._ssh_tracker.check_allowed = lambda: None
+    real_close = shim._close_control_master
+    shim._close_control_master = lambda: None
+    try:
+        try:
+            shim.create_tunnel(_free_port())
+        except RuntimeError:
+            pass
+    finally:
+        shim._spawn_ssh, shim.check_port_available, shim._control_master_state = real
+        shim.time.sleep, shim._ssh_tracker.check_allowed = real_sleep, real_allowed
+        shim._close_control_master = real_close
+    results.append(check(
+        "create_tunnel spawns ssh with INT/HUP ignored",
+        bool(seen) and seen[0][:4] == shim._ignoring_terminal_signals([])[:4]
+        and seen[0][4] == "ssh",
+        True))
+    return results
+
+
 def main():
     results = []
     port = _free_port()
@@ -360,6 +422,7 @@ def main():
     results.extend(_check_timeout_only_with_live_master())
     results.extend(_check_unbounded_by_default())
     results.extend(_check_timeout_not_retried())
+    results.extend(_check_tunnel_survives_ctrl_c())
 
     print()
     print("{}/{} checks passed".format(sum(results), len(results)))

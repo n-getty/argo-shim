@@ -1444,6 +1444,21 @@ def _spawn_ssh(cmd, what, timeout=None):
     )
 
 
+def _ignoring_terminal_signals(cmd):
+    """Wrap cmd so it starts with SIGINT and SIGHUP ignored.
+
+    `ssh -f` daemonizes the ControlMaster into its own session, but the -J hop
+    runs as a separate `ssh -W` child spawned before that, and it stays in the
+    terminal's foreground process group. Without this, Ctrl-C on the shim (or
+    closing the terminal) kills that proxy, which takes the persisted master
+    down with it — so every rerun needed a fresh Duo login despite
+    ControlPersist=yes. SIG_IGN survives exec, and ssh keeps an inherited
+    SIG_IGN rather than installing its own handler. Ctrl-C at the Duo prompt
+    still aborts: Python raises KeyboardInterrupt and subprocess.run kills ssh.
+    """
+    return ["/bin/sh", "-c", 'trap "" INT HUP; exec "$@"', "sh", *cmd]
+
+
 def create_tunnel(port, host="127.0.0.1", bind_address="127.0.0.1"):
     """Create a new SSH tunnel on the given port and verify it's working."""
     _ssh_tracker.check_allowed()
@@ -1476,7 +1491,7 @@ def create_tunnel(port, host="127.0.0.1", bind_address="127.0.0.1"):
         print("  Existing SSH control master is unresponsive; closing it.")
         _close_control_master()
     timeout = _MUX_SPAWN_TIMEOUT if master == "alive" else None
-    _spawn_ssh(cmd, "SSH tunnel", timeout=timeout)
+    _spawn_ssh(_ignoring_terminal_signals(cmd), "SSH tunnel", timeout=timeout)
 
     # Wait for tunnel to start accepting connections
     for i in range(10):
