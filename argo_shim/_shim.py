@@ -1050,6 +1050,9 @@ class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
             print("Tunnel is remote — cannot recover locally. Check the relay or UAN.")
             return False
         with self._tunnel_lock:
+            # Never start an SSH login (and a Duo prompt) while shutting down.
+            if _SHUTTING_DOWN.is_set():
+                return False
             # Re-check under lock — another thread may have already recovered
             if find_existing_tunnel(self.target_port):
                 return True
@@ -1378,6 +1381,29 @@ def stop_own_shim(listen_port, host="127.0.0.1"):
     return False
 
 
+_SHUTTING_DOWN = threading.Event()
+_ACTIVE_SSH = set()
+_ACTIVE_SSH_LOCK = threading.Lock()
+
+
+def _begin_shutdown():
+    """Stop further tunnel recovery and kill any ssh still authenticating.
+
+    The tunnel's ssh ignores SIGINT (see _ignoring_terminal_signals), so a
+    recovery ssh sitting at a Duo prompt would otherwise outlive the shim and
+    keep prompting on the terminal. Already-forked tunnels are not in
+    _ACTIVE_SSH (their parent ssh has exited), so the persisted master stays.
+    """
+    _SHUTTING_DOWN.set()
+    with _ACTIVE_SSH_LOCK:
+        procs = list(_ACTIVE_SSH)
+    for p in procs:
+        try:
+            p.kill()
+        except Exception:
+            pass
+
+
 def _spawn_ssh(cmd, what, timeout=None):
     """Run a forking ssh command (`ssh -N -f ...`), capturing stderr to a file.
 
@@ -1420,16 +1446,34 @@ def _spawn_ssh(cmd, what, timeout=None):
     auth-type kinds count), and raise SSHAuthError with an actionable hint.
     Returns nothing on success.
     """
+    if _SHUTTING_DOWN.is_set():
+        raise RuntimeError(f"{what} skipped: argo-shim is shutting down")
     with tempfile.TemporaryFile(mode="w+") as errfile:
+        proc = subprocess.Popen(cmd, stderr=errfile)
+        with _ACTIVE_SSH_LOCK:
+            _ACTIVE_SSH.add(proc)
         try:
-            result = subprocess.run(cmd, stderr=errfile, timeout=timeout)
+            proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
             _close_control_master()
             raise SSHTimeoutError(
                 f"{what} timed out after {timeout}s waiting for an existing ssh "
                 f"ControlMaster to respond (likely wedged); closed it so the next "
                 f"attempt starts a fresh session."
             )
+        except BaseException:
+            # e.g. KeyboardInterrupt at a startup Duo prompt: don't orphan ssh.
+            proc.kill()
+            proc.wait()
+            raise
+        finally:
+            with _ACTIVE_SSH_LOCK:
+                _ACTIVE_SSH.discard(proc)
+        if _SHUTTING_DOWN.is_set() and proc.returncode != 0:
+            raise RuntimeError(f"{what} aborted: argo-shim is shutting down")
+        result = proc
         errfile.seek(0)
         stderr = errfile.read().strip()
     if result.returncode == 0:
@@ -1453,8 +1497,10 @@ def _ignoring_terminal_signals(cmd):
     closing the terminal) kills that proxy, which takes the persisted master
     down with it — so every rerun needed a fresh Duo login despite
     ControlPersist=yes. SIG_IGN survives exec, and ssh keeps an inherited
-    SIG_IGN rather than installing its own handler. Ctrl-C at the Duo prompt
-    still aborts: Python raises KeyboardInterrupt and subprocess.run kills ssh.
+    SIG_IGN rather than installing its own handler. So the shim, not the
+    terminal, must kill an ssh still at a Duo prompt: _spawn_ssh does on
+    KeyboardInterrupt (startup), and _begin_shutdown does on SIGINT/SIGTERM
+    while serving (where a recovery thread may be mid-login).
     """
     return ["/bin/sh", "-c", 'trap "" INT HUP; exec "$@"', "sh", *cmd]
 
@@ -3010,6 +3056,7 @@ def _run():
         def shutdown_handler(signum, frame):
             signame = signal.Signals(signum).name
             print(f"\n{signame} received, shutting down...")
+            _begin_shutdown()
             threading.Thread(target=httpd.shutdown).start()
 
         signal.signal(signal.SIGINT, shutdown_handler)
