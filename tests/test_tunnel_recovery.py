@@ -330,6 +330,94 @@ def _check_tunnel_survives_ctrl_c():
     return results
 
 
+def _check_shutdown_stops_ssh():
+    """Ctrl-C while serving must not start, or leave behind, an SSH login.
+
+    Regression seen live: SIGINT during a streaming request dropped the
+    tunnel, a request thread called recover_tunnel, and its ssh (which
+    ignores SIGINT) sat at a Duo prompt after "Shim stopped.", re-prompting
+    every time the user hit Ctrl-C.
+    """
+    import threading
+    import time
+    results = []
+
+    # 1. recover_tunnel refuses once shutdown has begun.
+    calls = []
+    real_create, real_find = shim.create_tunnel, shim.find_existing_tunnel
+    shim.create_tunnel = lambda port, *a, **k: calls.append(port)
+    shim.find_existing_tunnel = lambda port, host="127.0.0.1": False
+    fake = type("S", (), {"tunnel_is_remote": False, "target_port": 1,
+                          "_tunnel_lock": threading.Lock()})()
+    shim._SHUTTING_DOWN.set()
+    try:
+        ok = shim.ThreadedTCPServer.recover_tunnel(fake)
+    finally:
+        shim._SHUTTING_DOWN.clear()
+        shim.create_tunnel, shim.find_existing_tunnel = real_create, real_find
+    results.append(check("recover_tunnel is a no-op during shutdown",
+                         (ok, calls), (False, [])))
+
+    # 2. an ssh already mid-login (sleep stands in for a Duo prompt that
+    #    ignores SIGINT) is killed by shutdown, and nothing is recorded
+    #    against the auth lockout.
+    real_record = shim._ssh_tracker.record_failure
+    failures = []
+    shim._ssh_tracker.record_failure = lambda kind="unknown": failures.append(kind)
+    box = {}
+
+    def run():
+        try:
+            shim._spawn_ssh(shim._ignoring_terminal_signals(["sleep", "30"]), "test")
+        except Exception as e:
+            box["err"] = e
+
+    t = threading.Thread(target=run)
+    start = time.time()
+    t.start()
+    time.sleep(0.5)
+    shim._begin_shutdown()
+    t.join(5)
+    shim._SHUTTING_DOWN.clear()
+    shim._ssh_tracker.record_failure = real_record
+    results.append(check("shutdown kills an in-progress ssh promptly",
+                         (not t.is_alive()) and time.time() - start < 5, True))
+    results.append(check("killed ssh raises a shutdown RuntimeError, not SSHAuthError",
+                         type(box.get("err")).__name__ + (
+                             ":shutting down" if "shutting down" in str(box.get("err")) else ""),
+                         "RuntimeError:shutting down"))
+    results.append(check("shutdown kill not recorded against the auth lockout",
+                         failures, []))
+
+    # 3. KeyboardInterrupt (Ctrl-C at the startup Duo prompt) kills ssh.
+    import subprocess
+    real_popen = subprocess.Popen
+    spawned = []
+
+    class P(real_popen):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            spawned.append(self)
+
+        def wait(self, timeout=None):
+            if not getattr(self, "_interrupted", False):
+                self._interrupted = True
+                raise KeyboardInterrupt
+            return super().wait(timeout)
+
+    shim.subprocess.Popen = P
+    try:
+        try:
+            shim._spawn_ssh(shim._ignoring_terminal_signals(["sleep", "30"]), "test")
+        except KeyboardInterrupt:
+            pass
+    finally:
+        shim.subprocess.Popen = real_popen
+    results.append(check("Ctrl-C at a startup prompt leaves no orphaned ssh",
+                         bool(spawned) and spawned[0].poll() is not None, True))
+    return results
+
+
 def main():
     results = []
     port = _free_port()
@@ -423,6 +511,7 @@ def main():
     results.extend(_check_unbounded_by_default())
     results.extend(_check_timeout_not_retried())
     results.extend(_check_tunnel_survives_ctrl_c())
+    results.extend(_check_shutdown_stops_ssh())
 
     print()
     print("{}/{} checks passed".format(sum(results), len(results)))
