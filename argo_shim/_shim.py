@@ -345,6 +345,18 @@ class SSHAuthError(RuntimeError):
     pass
 
 
+class SSHTimeoutError(RuntimeError):
+    """Raised when an ssh client is killed for exceeding its timeout.
+
+    Distinct from plain RuntimeError so the auto port-pair retry loops do NOT
+    treat it as a port problem: retrying on a new port opens a fresh SSH
+    connection, which can mean another Duo prompt and another login attempt
+    against CELS. Not an SSHAuthError either — a hang is not a rejected
+    credential and must not count toward the auth lockout.
+    """
+    pass
+
+
 class SSHAttemptTracker:
     """Track SSH failures *across restarts* to avoid triggering CSPO IP blocks.
 
@@ -1366,7 +1378,7 @@ def stop_own_shim(listen_port, host="127.0.0.1"):
     return False
 
 
-def _spawn_ssh(cmd, what, timeout=30):
+def _spawn_ssh(cmd, what, timeout=None):
     """Run a forking ssh command (`ssh -N -f ...`), capturing stderr to a file.
 
     `ssh -f` authenticates in the foreground (including the interactive Duo
@@ -1382,19 +1394,26 @@ def _spawn_ssh(cmd, what, timeout=30):
     connection diagnostics (written by the parent before it forks) are still on
     disk for us to classify.
 
-    `timeout` bounds the whole call. All call sites pass BatchMode=yes, so this
-    is never waiting on a human at a Duo prompt — it exists for a different
-    failure: when ControlMaster=auto hands the forward request to an existing
-    multiplexed master, the new ssh client blocks synchronously on that
-    master's reply, and OpenSSH puts no timeout of its own on that handshake.
-    A master that is alive enough to hold its control socket open but can no
-    longer service requests (e.g. its underlying session to a NAT/firewall was
-    silently dropped) hangs the new client — and therefore create_tunnel, and
-    therefore recover_tunnel's lock — forever. On timeout we kill the hung
-    client, close that control master so the next attempt opens a fresh
-    session instead of hanging the same way again, and raise plain
-    RuntimeError: a wedged master is not a credential failure and must not
-    count toward the SSH auth lockout.
+    `timeout` (default None = unbounded) bounds the whole call. It must ONLY be
+    set when the command is known to be served by an existing, responsive
+    ControlMaster (see create_tunnel / _control_master_state). Do NOT assume
+    BatchMode=yes rules out an interactive prompt: BatchMode is not propagated
+    to the ProxyJump (-J) hop, which runs its own ssh and can still show the
+    Duo prompt on /dev/tty. A fresh connection can therefore legitimately sit
+    waiting on a human for well over 30s, and killing it mid-Duo is exactly the
+    0.3.27 regression this guards against.
+
+    The timeout exists for one failure: when ControlMaster=auto hands the
+    forward request to an existing multiplexed master, the new ssh client
+    blocks synchronously on that master's reply, and OpenSSH puts no timeout of
+    its own on that handshake. A master that is alive enough to hold its
+    control socket open but can no longer service requests hangs the new
+    client — and therefore create_tunnel, and therefore recover_tunnel's lock —
+    forever. On timeout we kill the hung client, close that control master so
+    the next attempt opens a fresh session, and raise SSHTimeoutError: not
+    SSHAuthError (a hang is not a credential failure and must not count toward
+    the auth lockout), and not plain RuntimeError (the port-pair retry loops
+    must not answer a hang by opening yet another SSH connection).
 
     On a normal failure: print the captured stderr (so the user still sees
     it), classify the error, record it against the persistent lockout (only
@@ -1406,10 +1425,10 @@ def _spawn_ssh(cmd, what, timeout=30):
             result = subprocess.run(cmd, stderr=errfile, timeout=timeout)
         except subprocess.TimeoutExpired:
             _close_control_master()
-            raise RuntimeError(
-                f"{what} timed out after {timeout}s waiting for ssh to respond "
-                f"(likely a wedged ControlMaster); closed it so the next attempt "
-                f"starts a fresh session."
+            raise SSHTimeoutError(
+                f"{what} timed out after {timeout}s waiting for an existing ssh "
+                f"ControlMaster to respond (likely wedged); closed it so the next "
+                f"attempt starts a fresh session."
             )
         errfile.seek(0)
         stderr = errfile.read().strip()
@@ -1423,6 +1442,21 @@ def _spawn_ssh(cmd, what, timeout=30):
     raise SSHAuthError(
         f"{what} failed (exit code {result.returncode}, cause: {kind}).\n  {hint}"
     )
+
+
+def _ignoring_terminal_signals(cmd):
+    """Wrap cmd so it starts with SIGINT and SIGHUP ignored.
+
+    `ssh -f` daemonizes the ControlMaster into its own session, but the -J hop
+    runs as a separate `ssh -W` child spawned before that, and it stays in the
+    terminal's foreground process group. Without this, Ctrl-C on the shim (or
+    closing the terminal) kills that proxy, which takes the persisted master
+    down with it — so every rerun needed a fresh Duo login despite
+    ControlPersist=yes. SIG_IGN survives exec, and ssh keeps an inherited
+    SIG_IGN rather than installing its own handler. Ctrl-C at the Duo prompt
+    still aborts: Python raises KeyboardInterrupt and subprocess.run kills ssh.
+    """
+    return ["/bin/sh", "-c", 'trap "" INT HUP; exec "$@"', "sh", *cmd]
 
 
 def create_tunnel(port, host="127.0.0.1", bind_address="127.0.0.1"):
@@ -1449,7 +1483,15 @@ def create_tunnel(port, host="127.0.0.1", bind_address="127.0.0.1"):
     ])
     print(f"Creating SSH tunnel on port {port}...")
     print(f"  $ {' '.join(cmd)}")
-    _spawn_ssh(cmd, "SSH tunnel")
+    # Only bound the ssh call when it will be served by a live, responsive
+    # master (no auth involved). Otherwise this is a fresh connection that may
+    # be sitting at a Duo prompt on the -J hop, and must never be killed.
+    master = _control_master_state()
+    if master == "wedged":
+        print("  Existing SSH control master is unresponsive; closing it.")
+        _close_control_master()
+    timeout = _MUX_SPAWN_TIMEOUT if master == "alive" else None
+    _spawn_ssh(_ignoring_terminal_signals(cmd), "SSH tunnel", timeout=timeout)
 
     # Wait for tunnel to start accepting connections
     for i in range(10):
@@ -1481,15 +1523,48 @@ def create_tunnel(port, host="127.0.0.1", bind_address="127.0.0.1"):
     return port
 
 
-def _close_control_master():
-    """Ask the argo-shim ssh control master to exit. Best-effort; ignore errors."""
-    cmd = ["ssh", "-O", "exit",
+_MUX_SPAWN_TIMEOUT = 30
+_MUX_CHECK_TIMEOUT = 5
+
+
+def _control_master_cmd(op):
+    """`ssh -O <op>` addressed at the same master create_tunnel uses.
+
+    -J and the destination must match create_tunnel's so %C hashes to the same
+    ControlPath. `-O` operations only talk to the local control socket; they
+    never open a network connection or authenticate.
+    """
+    cmd = ["ssh", "-O", op,
            "-o", "ControlPath=~/.ssh/argo-shim-%C"]
     if SSH_PROXY_JUMP:
         cmd.extend(["-J", f"{API_KEY}@{SSH_PROXY_JUMP}"])
     cmd.append(f"{API_KEY}@{SSH_JUMP_HOST}")
+    return cmd
+
+
+def _control_master_state():
+    """Return "alive", "absent", or "wedged" for the argo-shim control master.
+
+    "wedged" means the check itself hung: a socket exists but the master isn't
+    answering. Any other error (ssh missing, etc.) is reported as "absent" so
+    the caller falls back to the safe, unbounded path.
+    """
     try:
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+        result = subprocess.run(_control_master_cmd("check"),
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                timeout=_MUX_CHECK_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return "wedged"
+    except Exception:
+        return "absent"
+    return "alive" if result.returncode == 0 else "absent"
+
+
+def _close_control_master():
+    """Ask the argo-shim ssh control master to exit. Best-effort; ignore errors."""
+    try:
+        subprocess.run(_control_master_cmd("exit"),
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
     except Exception:
         pass
 
@@ -2680,8 +2755,8 @@ def _run():
                 try:
                     create_tunnel(tunnel_port, bind_address="0.0.0.0")
                     break
-                except SSHAuthError:
-                    raise  # Don't retry on auth failures — risk IP block
+                except (SSHAuthError, SSHTimeoutError):
+                    raise  # Never retry: a new port means a new SSH login (Duo, IP-block risk)
                 except RuntimeError:
                     if attempt + 1 >= max_retries:
                         raise
@@ -2728,7 +2803,7 @@ def _run():
                     try:
                         create_tunnel(tunnel_port)
                         break
-                    except SSHAuthError:
+                    except (SSHAuthError, SSHTimeoutError):
                         raise
                     except RuntimeError:
                         if attempt + 1 >= max_retries:
@@ -2826,8 +2901,8 @@ def _run():
                 try:
                     create_tunnel(tunnel_port)
                     break
-                except SSHAuthError:
-                    raise  # Don't retry on auth failures — risk IP block
+                except (SSHAuthError, SSHTimeoutError):
+                    raise  # Never retry: a new port means a new SSH login (Duo, IP-block risk)
                 except RuntimeError:
                     if attempt + 1 >= max_retries:
                         raise
@@ -2879,8 +2954,8 @@ def _run():
             try:
                 create_tunnel(tunnel_port)
                 break
-            except SSHAuthError:
-                raise  # Don't retry on auth failures — risk IP block
+            except (SSHAuthError, SSHTimeoutError):
+                raise  # Never retry: a new port means a new SSH login (Duo, IP-block risk)
             except RuntimeError:
                 if attempt + 1 >= max_retries:
                     raise
@@ -2993,6 +3068,10 @@ def main():
         print("  get this shared login node's IP blocked for everyone. Fix the",
               file=sys.stderr)
         print("  issue above first, then try again.", file=sys.stderr)
+        sys.exit(1)
+    except SSHTimeoutError as e:
+        _print_fatal("the SSH tunnel did not come up", e)
+        print("  Re-run argo-shim to open a fresh SSH session.", file=sys.stderr)
         sys.exit(1)
     except RuntimeError as e:
         # Typically port exhaustion / verification failure — not an auth problem.

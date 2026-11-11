@@ -49,8 +49,17 @@ is bounded by `timeout`, a hang raises plain RuntimeError (not SSHAuthError —
 a hang is not a credential failure), closes the control master, and does not
 touch the auth lockout.
 
-This must fail (step 2 of the first case) on the commit before the fix and
-pass from it onward.
+Third: the 0.3.27 regression. That timeout was applied to every
+create_tunnel call, assuming BatchMode=yes meant ssh could never wait on a
+human — but BatchMode is not propagated to the ProxyJump (-J) hop, so a fresh
+connection still shows the Duo prompt there. A slow Duo approval got killed,
+and the resulting RuntimeError made the port-pair retry open yet another SSH
+login (another Duo prompt, more IP-block risk). The checks now prove:
+  * the timeout is applied only when `ssh -O check` finds a live master;
+    a fresh connection is unbounded, and a master whose check hangs is closed
+    first so the fresh connection can't be handed to it;
+  * a timeout raises SSHTimeoutError, which the retry loops re-raise instead
+    of trying another port (plain RuntimeError still retries).
 """
 import os
 import socket
@@ -99,9 +108,14 @@ def _check_spawn_ssh_timeout():
             raised = e
 
         results.append(check(
-            "a hung ssh client raises plain RuntimeError, not SSHAuthError",
+            "a hung ssh client raises SSHTimeoutError (not SSHAuthError)",
             type(raised).__name__ if raised else None,
-            "RuntimeError",
+            "SSHTimeoutError",
+        ))
+        results.append(check(
+            "SSHTimeoutError is still a RuntimeError (generic handlers catch it)",
+            isinstance(raised, RuntimeError),
+            True,
         ))
         results.append(check(
             "timeout message names the timeout",
@@ -125,6 +139,197 @@ def _check_spawn_ssh_timeout():
     return results
 
 
+def _check_timeout_only_with_live_master():
+    """create_tunnel bounds ssh ONLY when reusing a responsive master.
+
+    0.3.27 regression: create_tunnel always passed a 30s timeout, but
+    BatchMode=yes is not propagated to the ProxyJump hop, so a fresh
+    connection can sit at a Duo prompt. The timeout killed it mid-Duo.
+    """
+    results = []
+    real = {name: getattr(shim, name) for name in (
+        "_spawn_ssh", "_close_control_master", "_control_master_state",
+        "check_port_available", "verify_tunnel")}
+    real_sleep = shim.time.sleep
+    real_check_allowed = shim._ssh_tracker.check_allowed
+    real_record_success = shim._ssh_tracker.record_success
+
+    seen = []
+    close_calls = []
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(16)
+    port = listener.getsockname()[1]
+
+    shim._spawn_ssh = lambda cmd, what, timeout=None: seen.append(timeout)
+    shim._close_control_master = lambda: close_calls.append(True)
+    shim.check_port_available = lambda port, bind_address="127.0.0.1": None
+    shim.verify_tunnel = lambda port, host="127.0.0.1": True
+    shim.time.sleep = lambda s: None
+    shim._ssh_tracker.check_allowed = lambda: None
+    shim._ssh_tracker.record_success = lambda: None
+
+    try:
+        for state, want_timeout, want_close in (
+                ("absent", None, 0),
+                ("wedged", None, 1),
+                ("alive", shim._MUX_SPAWN_TIMEOUT, 0)):
+            seen.clear()
+            close_calls.clear()
+            shim._control_master_state = lambda s=state: s
+            shim.create_tunnel(port)
+            results.append(check(
+                "master {}: ssh timeout is {!r}".format(state, want_timeout),
+                seen, [want_timeout]))
+            results.append(check(
+                "master {}: control master closed {}x before connecting".format(
+                    state, want_close),
+                len(close_calls), want_close))
+    finally:
+        listener.close()
+        for name, fn in real.items():
+            setattr(shim, name, fn)
+        shim.time.sleep = real_sleep
+        shim._ssh_tracker.check_allowed = real_check_allowed
+        shim._ssh_tracker.record_success = real_record_success
+    return results
+
+
+def _check_unbounded_by_default():
+    """_spawn_ssh without an explicit timeout must wait as long as ssh does.
+
+    `sleep 1` stands in for a user taking a while to approve a Duo push.
+    """
+    import inspect
+    results = [check(
+        "_spawn_ssh default timeout is None",
+        inspect.signature(shim._spawn_ssh).parameters["timeout"].default,
+        None,
+    )]
+    raised = None
+    try:
+        shim._spawn_ssh(["sleep", "1"], "slow auth")
+    except Exception as e:
+        raised = e
+    results.append(check("a slow (Duo-length) ssh is not killed", raised, None))
+    return results
+
+
+def _check_timeout_not_retried():
+    """An ssh timeout must NOT trigger the auto port-pair retry.
+
+    Each retry is a fresh SSH login: another Duo prompt, and more failed
+    attempts counting toward a CELS IP block. Plain RuntimeError (e.g. the
+    port never coming up) must still retry, which proves the harness works.
+    """
+    results = []
+    real = {name: getattr(shim, name) for name in (
+        "create_tunnel", "find_existing_tunnel", "preflight_ssh_checks",
+        "probe_shim", "_port_bindable", "read_existing_token")}
+    real_argv = sys.argv
+    calls = []
+
+    shim.find_existing_tunnel = lambda port, host="127.0.0.1": False
+    shim.preflight_ssh_checks = lambda: True
+    shim.probe_shim = lambda *a, **k: "down"
+    shim._port_bindable = lambda *a, **k: True
+    shim.read_existing_token = lambda: None
+
+    devnull = open(os.devnull, "w")
+    real_stdout = sys.stdout
+    try:
+        for argv in (["argo-shim"], ["argo-shim", "--tunnel"]):
+            for exc, want_calls in ((shim.SSHTimeoutError, 1), (RuntimeError, 3)):
+                calls.clear()
+
+                def fake_create_tunnel(port, *a, _exc=exc, **k):
+                    calls.append(port)
+                    raise _exc("boom")
+
+                shim.create_tunnel = fake_create_tunnel
+                sys.argv = argv
+                sys.stdout = devnull
+                try:
+                    shim._run()
+                except RuntimeError:
+                    pass
+                finally:
+                    sys.stdout = real_stdout
+                results.append(check(
+                    "{}: {} -> create_tunnel called {}x".format(
+                        " ".join(argv[1:]) or "default mode", exc.__name__, want_calls),
+                    len(calls), want_calls))
+    finally:
+        sys.stdout = real_stdout
+        devnull.close()
+        sys.argv = real_argv
+        for name, fn in real.items():
+            setattr(shim, name, fn)
+    return results
+
+
+def _check_tunnel_survives_ctrl_c():
+    """The tunnel's ssh tree must survive a terminal SIGINT/SIGHUP.
+
+    Stand-in for ssh + its -J `ssh -W` child: a python parent that spawns a
+    `sleep` grandchild, all in one process group (like the terminal's
+    foreground group). Sending SIGINT to the group mimics Ctrl-C. A bare
+    command is the control: it must die, proving the signal really landed.
+    """
+    import signal
+    import subprocess
+    import time
+    tree = [sys.executable, "-c",
+            "import subprocess; subprocess.run(['sleep', '5'])"]
+    results = []
+    for label, cmd, want_alive in (
+            ("unwrapped (control)", tree, False),
+            ("wrapped", shim._ignoring_terminal_signals(tree), True)):
+        for sig in (signal.SIGINT, signal.SIGHUP):
+            p = subprocess.Popen(cmd, start_new_session=True)
+            try:
+                time.sleep(0.5)
+                os.killpg(p.pid, sig)
+                time.sleep(0.5)
+                alive = p.poll() is None
+            finally:
+                try:
+                    os.killpg(p.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                p.wait()
+            results.append(check(
+                "{}: ssh tree {} {}".format(
+                    label, "survives" if want_alive else "is killed by", sig.name),
+                alive, want_alive))
+
+    seen = []
+    real = shim._spawn_ssh, shim.check_port_available, shim._control_master_state
+    real_sleep, real_allowed = shim.time.sleep, shim._ssh_tracker.check_allowed
+    shim._spawn_ssh = lambda cmd, what, timeout=None: seen.append(cmd)
+    shim.check_port_available = lambda port, bind_address="127.0.0.1": None
+    shim._control_master_state = lambda: "absent"
+    shim.time.sleep = lambda s: None
+    shim._ssh_tracker.check_allowed = lambda: None
+    real_close = shim._close_control_master
+    shim._close_control_master = lambda: None
+    try:
+        try:
+            shim.create_tunnel(_free_port())
+        except RuntimeError:
+            pass
+    finally:
+        shim._spawn_ssh, shim.check_port_available, shim._control_master_state = real
+        shim.time.sleep, shim._ssh_tracker.check_allowed = real_sleep, real_allowed
+        shim._close_control_master = real_close
+    results.append(check(
+        "create_tunnel spawns ssh with INT/HUP ignored",
+        bool(seen) and seen[0][:4] == shim._ignoring_terminal_signals([])[:4]
+        and seen[0][4] == "ssh",
+        True))
+    return results
+
+
 def main():
     results = []
     port = _free_port()
@@ -137,12 +342,13 @@ def main():
     real_sleep = shim.time.sleep
     real_check_allowed = shim._ssh_tracker.check_allowed
     real_record_failure = shim._ssh_tracker.record_failure
+    real_master_state = shim._control_master_state
 
     spawn_cmd = {}
     close_calls = []
     failure_calls = []
 
-    def fake_spawn_ssh(cmd, what):
+    def fake_spawn_ssh(cmd, what, timeout=None):
         # Stand-in for a real ssh client handing the forward request to an
         # already-wedged ControlMaster: the client process exits 0 (this
         # function just returns, mirroring _spawn_ssh's success path) but
@@ -163,6 +369,7 @@ def main():
     shim.time.sleep = lambda s: None  # skip the 5s poll-timeout wait
     shim._ssh_tracker.check_allowed = lambda: None
     shim._ssh_tracker.record_failure = fake_record_failure
+    shim._control_master_state = lambda: "absent"
 
     try:
         raised = None
@@ -209,8 +416,13 @@ def main():
         shim.time.sleep = real_sleep
         shim._ssh_tracker.check_allowed = real_check_allowed
         shim._ssh_tracker.record_failure = real_record_failure
+        shim._control_master_state = real_master_state
 
     results.extend(_check_spawn_ssh_timeout())
+    results.extend(_check_timeout_only_with_live_master())
+    results.extend(_check_unbounded_by_default())
+    results.extend(_check_timeout_not_retried())
+    results.extend(_check_tunnel_survives_ctrl_c())
 
     print()
     print("{}/{} checks passed".format(sum(results), len(results)))
